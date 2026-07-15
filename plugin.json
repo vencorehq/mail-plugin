@@ -1,0 +1,77 @@
+{
+  "id": "mail-plugin",
+  "name": "Mail Integration",
+  "version": "1.0.0",
+  "sdk_version": "0.1.0",
+  "description": "Gmail and IMAP integration for Vencore, providing low-latency mailbox syncing.",
+  "author": "Vencore",
+  "data_access": ["storage:read", "storage:write", "http:fetch"],
+  "tables": [
+    {
+      "name": "mail_accounts",
+      "columns": [
+        { "name": "id", "type": "uuid", "primary": true },
+        { "name": "type", "type": "text" },
+        { "name": "email", "type": "text" },
+        { "name": "credentials", "type": "jsonb" },
+        { "name": "status", "type": "text" },
+        { "name": "created_at", "type": "timestamptz" }
+      ],
+      "drop_on_uninstall": true
+    },
+    {
+      "name": "mail_folders",
+      "columns": [
+        { "name": "id", "type": "uuid", "primary": true },
+        { "name": "account_id", "type": "uuid" },
+        { "name": "name", "type": "text" },
+        { "name": "type", "type": "text" },
+        { "name": "unread_count", "type": "integer" },
+        { "name": "total_count", "type": "integer" }
+      ],
+      "drop_on_uninstall": true
+    },
+    {
+      "name": "mail_messages",
+      "columns": [
+        { "name": "id", "type": "uuid", "primary": true },
+        { "name": "account_id", "type": "uuid" },
+        { "name": "folder_id", "type": "uuid" },
+        { "name": "external_id", "type": "text" },
+        { "name": "subject", "type": "text" },
+        { "name": "sender", "type": "text" },
+        { "name": "recipient", "type": "text" },
+        { "name": "date", "type": "timestamptz" },
+        { "name": "snippet", "type": "text" },
+        { "name": "is_read", "type": "boolean" },
+        { "name": "flags", "type": "jsonb" }
+      ],
+      "drop_on_uninstall": true
+    }
+  ],
+  "surfaces": {
+    "nav": [
+      { "label": "Mail", "path": "/mail", "icon": "mail", "group": "general" }
+    ],
+    "pages": [
+      { "path": "/mail", "title": "Mail Workspace" }
+    ]
+  },
+  "settings_schema": [
+    {
+      "type": "text",
+      "key": "google_client_id",
+      "label": "Google OAuth Client ID"
+    },
+    {
+      "type": "text",
+      "key": "google_client_secret",
+      "label": "Google OAuth Client Secret",
+      "secret": true
+    }
+  ],
+  "build": {
+    "server": "src/server.ts",
+    "client": "src/client.tsx"
+  }
+}
