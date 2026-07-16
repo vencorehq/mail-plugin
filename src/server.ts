@@ -1,94 +1,60 @@
 import type { MailAccount, MailFolder, MailMessage } from './types';
 
-// Declare global Vencore sandbox SDK object
-declare const vencore: {
-  table(name: string): {
-    list(opts?: { where?: Record<string, unknown>; limit?: number; offset?: number }): Promise<any[]>;
-    get(id: string): Promise<any>;
-    insert(data: Record<string, unknown>): Promise<any>;
-    update(id: string, data: Record<string, unknown>): Promise<any>;
-    delete(id: string): Promise<void>;
-    upsert(data: Record<string, unknown>, opts: { on_conflict: string }): Promise<any>;
-    count(where?: Record<string, unknown>): Promise<number>;
-  };
-  settings: {
-    get(key: string): Promise<string | undefined>;
-    getAll(): Promise<Record<string, string>>;
-  };
-  http: {
-    fetch(url: string, opts?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{
-      status: number;
-      body: string;
-      ok: boolean;
-    }>;
-  };
-  bus: {
-    on(event: string, handler: (payload: any) => void): void;
-    emit(event: string, payload: any): void;
-  };
-  cron: {
-    register(expr: string, fn: () => Promise<void>): void;
-  };
-  storage: {
-    get(key: string): Promise<any>;
-    set(key: string, value: any): Promise<void>;
-  };
+export default {
+  async setup(vencore: any) {
+    console.log('Initializing Vencore Mail Plugin...');
+
+    // 1. Register cron job for delta mail synchronization (runs every 60 seconds)
+    vencore.cron.register('*/1 * * * *', 'sync-mail', async () => {
+      try {
+        await syncAllAccounts(vencore);
+      } catch (err) {
+        console.error('Mail synchronization cron failed:', err);
+      }
+    });
+
+    // 2. Listen for on-demand fetch requests from the frontend client to get message body
+    vencore.bus.on('mail:fetch_body_request', async (payload: { messageId: string; accountId: string; replyEvent: string }) => {
+      try {
+        const body = await fetchMessageBodyFromSource(vencore, payload.accountId, payload.messageId);
+        vencore.bus.emit(payload.replyEvent, { success: true, body });
+      } catch (err) {
+        console.error('Failed to fetch message body on-demand:', err);
+        vencore.bus.emit(payload.replyEvent, { success: false, error: err instanceof Error ? err.message : 'Unknown error' });
+      }
+    });
+
+    // 3. Listen for manual sync trigger
+    vencore.bus.on('mail:sync_now_request', async (payload: { replyEvent: string }) => {
+      try {
+        await syncAllAccounts(vencore);
+        vencore.bus.emit(payload.replyEvent, { success: true });
+      } catch (err) {
+        vencore.bus.emit(payload.replyEvent, { success: false, error: String(err) });
+      }
+    });
+
+    // 4. Listen for folder configuration updates
+    vencore.bus.on('mail:mark_read_request', async (payload: { messageId: string; isRead: boolean }) => {
+      try {
+        await vencore.table('mail_messages').update(payload.messageId, { is_read: payload.isRead });
+        vencore.bus.emit('mail:message_updated', { messageId: payload.messageId, isRead: payload.isRead });
+      } catch (err) {
+        console.error('Failed to update message flags:', err);
+      }
+    });
+  }
 };
 
-// Initialize the plugin backend
-export async function init() {
-  console.log('Initializing Vencore Mail Plugin...');
-
-  // 1. Register cron job for delta mail synchronization (runs every 60 seconds)
-  vencore.cron.register('*/1 * * * *', async () => {
-    try {
-      await syncAllAccounts();
-    } catch (err) {
-      console.error('Mail synchronization cron failed:', err);
-    }
-  });
-
-  // 2. Listen for on-demand fetch requests from the frontend client to get message body
-  vencore.bus.on('mail:fetch_body_request', async (payload: { messageId: string; accountId: string; replyEvent: string }) => {
-    try {
-      const body = await fetchMessageBodyFromSource(payload.accountId, payload.messageId);
-      vencore.bus.emit(payload.replyEvent, { success: true, body });
-    } catch (err) {
-      console.error('Failed to fetch message body on-demand:', err);
-      vencore.bus.emit(payload.replyEvent, { success: false, error: err instanceof Error ? err.message : 'Unknown error' });
-    }
-  });
-
-  // 3. Listen for manual sync trigger
-  vencore.bus.on('mail:sync_now_request', async (payload: { replyEvent: string }) => {
-    try {
-      await syncAllAccounts();
-      vencore.bus.emit(payload.replyEvent, { success: true });
-    } catch (err) {
-      vencore.bus.emit(payload.replyEvent, { success: false, error: String(err) });
-    }
-  });
-
-  // 4. Listen for folder configuration updates
-  vencore.bus.on('mail:mark_read_request', async (payload: { messageId: string; isRead: boolean }) => {
-    try {
-      await vencore.table('mail_messages').update(payload.messageId, { is_read: payload.isRead });
-      vencore.bus.emit('mail:message_updated', { messageId: payload.messageId, isRead: payload.isRead });
-    } catch (err) {
-      console.error('Failed to update message flags:', err);
-    }
-  });
-}
-
 // Synchronize all connected mail accounts
-async function syncAllAccounts() {
+async function syncAllAccounts(vencore: any) {
   const accounts = (await vencore.table('mail_accounts').list()) as MailAccount[];
   
   for (const account of accounts) {
     if (account.status !== 'active') continue;
     
     try {
-      await syncAccount(account);
+      await syncAccount(vencore, account);
     } catch (err) {
       console.error(`Failed to sync account: ${account.email}`, err);
       await vencore.table('mail_accounts').update(account.id, { status: 'error' });
@@ -97,7 +63,7 @@ async function syncAllAccounts() {
 }
 
 // Synchronize folders and new messages for a single mail account
-async function syncAccount(account: MailAccount) {
+async function syncAccount(vencore: any, account: MailAccount) {
   // Sync folders list first (Inbox, Sent, Spam, Trash, etc.)
   const folders = await fetchFoldersFromSource(account);
   
@@ -235,7 +201,7 @@ async function fetchNewMessagesFromSource(
 }
 
 // Fetch mail message HTML/plain text body on-demand (keeps DB light)
-async function fetchMessageBodyFromSource(accountId: string, messageId: string): Promise<string> {
+async function fetchMessageBodyFromSource(vencore: any, accountId: string, messageId: string): Promise<string> {
   // Pull message metadata from DB to check type
   const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
   if (!msg) throw new Error('Message not found');
@@ -303,6 +269,3 @@ async function fetchMessageBodyFromSource(accountId: string, messageId: string):
     </div>
   `;
 }
-
-// Auto-initialize when loaded
-init().catch(console.error);
