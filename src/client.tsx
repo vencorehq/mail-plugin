@@ -1,23 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import type { MailAccount, MailFolder, MailMessage } from './types';
 
-// Declare global Vencore client SDK object
-declare const vencore: {
-  table(name: string): {
-    list(opts?: { where?: Record<string, unknown>; limit?: number; offset?: number }): Promise<any[]>;
-    get(id: string): Promise<any>;
-    insert(data: Record<string, unknown>): Promise<any>;
-    update(id: string, data: Record<string, unknown>): Promise<any>;
-    delete(id: string): Promise<void>;
-    count(where?: Record<string, unknown>): Promise<number>;
-  };
-  bus: {
-    on(event: string, handler: (payload: any) => void): void;
-    emit(event: string, payload: any): void;
-  };
+// Module-scoped vencore reference passed down by the host runtime on setup
+let vencore: any;
+
+export default {
+  setup(v: any) {
+    vencore = v;
+    v.registerPage('/mail', MailWorkspace);
+    v.registerPage('/', MailWorkspace);
+  }
 };
 
-export default function MailWorkspace() {
+function MailWorkspace() {
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
   const [folders, setFolders] = useState<MailFolder[]>([]);
@@ -42,7 +37,7 @@ export default function MailWorkspace() {
     loadAccounts();
     
     // Listen for sync completions from backend
-    vencore.bus.on('mail:sync_completed', ({ accountId }) => {
+    vencore.bus.on('mail:sync_completed', ({ accountId }: { accountId: string }) => {
       console.log(`Sync completed for account: ${accountId}`);
       setIsSyncing(false);
       loadAccounts();
@@ -52,7 +47,7 @@ export default function MailWorkspace() {
     });
 
     // Listen for single message updates
-    vencore.bus.on('mail:message_updated', ({ messageId, isRead }) => {
+    vencore.bus.on('mail:message_updated', ({ messageId, isRead }: { messageId: string; isRead: boolean }) => {
       setMessages(prev => prev.map(m => m.id === messageId ? { ...m, is_read: isRead } : m));
       if (selectedMsg && selectedMsg.id === messageId) {
         setSelectedMsg(prev => prev ? { ...prev, is_read: isRead } : null);
