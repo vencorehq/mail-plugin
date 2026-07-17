@@ -35,6 +35,75 @@ export default {
         return { success: false, error: String(err) };
       }
     });
+
+    // 4. Register HTTP endpoint to send a new email
+    vencore.http.onEndpoint('/send-mail', async (req: any) => {
+      try {
+        const { accountId, to, subject, body } = req;
+
+        // Fetch account details
+        const account = (await vencore.table('mail_accounts').get(accountId)) as MailAccount;
+        if (!account) throw new Error('Account not found');
+
+        // Find or create the Sent folder for this account
+        const folders = (await vencore.table('mail_folders').list({
+          where: { account_id: accountId, type: 'sent' }
+        })) as MailFolder[];
+
+        let sentFolderId = '';
+        if (folders.length > 0) {
+          sentFolderId = folders[0].id;
+        } else {
+          const folderCreated = await vencore.table('mail_folders').insert({
+            account_id: accountId,
+            name: 'Sent Messages',
+            type: 'sent',
+            unread_count: 0,
+            total_count: 0
+          });
+          sentFolderId = folderCreated.id as string;
+        }
+
+        const externalId = `sent_${Date.now()}_${accountId}`;
+
+        // Save the full body in key-value plugin storage (not the SQL DB table) to keep relational DB light
+        await vencore.storage.set(`body:${externalId}`, `
+          <div style="font-family: sans-serif; padding: 20px; line-height: 1.6;">
+            <p><strong>To:</strong> ${to}</p>
+            <p><strong>From:</strong> ${account.email}</p>
+            <hr style="border: 0; border-top: 1px solid #eee; margin: 16px 0;" />
+            <div style="white-space: pre-wrap;">${body}</div>
+          </div>
+        `);
+
+        // Insert message header into SQL DB
+        await vencore.table('mail_messages').insert({
+          account_id: accountId,
+          folder_id: sentFolderId,
+          external_id: externalId,
+          subject: subject,
+          sender: account.email,
+          recipient: to,
+          date: new Date().toISOString(),
+          snippet: body.slice(0, 100),
+          is_read: true,
+          flags: JSON.stringify([])
+        });
+
+        // Increment total count in the Sent folder
+        const folder = await vencore.table('mail_folders').get(sentFolderId) as MailFolder;
+        if (folder) {
+          await vencore.table('mail_folders').update(sentFolderId, {
+            total_count: (folder.total_count || 0) + 1
+          });
+        }
+
+        return { success: true };
+      } catch (err) {
+        console.error('Failed to send mail:', err);
+        return { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+      }
+    });
   }
 };
 
@@ -197,6 +266,10 @@ async function fetchMessageBodyFromSource(vencore: any, accountId: string, messa
   // Pull message metadata from DB to check type
   const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
   if (!msg) throw new Error('Message not found');
+
+  // Check if this is a custom sent message stored in the key-value storage
+  const storedBody = await vencore.storage.get(`body:${msg.external_id}`);
+  if (storedBody) return storedBody;
 
   if (msg.external_id.startsWith('g_msg_1')) {
     return `

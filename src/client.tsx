@@ -32,6 +32,13 @@ function MailWorkspace() {
   const [newAccPort, setNewAccPort] = useState<number>(993);
   const [newAccPassword, setNewAccPassword] = useState<string>('');
 
+  // Compose email modal state
+  const [showComposeModal, setShowComposeModal] = useState<boolean>(false);
+  const [composeTo, setComposeTo] = useState<string>('');
+  const [composeSubject, setComposeSubject] = useState<string>('');
+  const [composeBody, setComposeBody] = useState<string>('');
+  const [isSending, setIsSending] = useState<boolean>(false);
+
   // 1. Initial Load: Fetch Accounts
   useEffect(() => {
     loadAccounts();
@@ -166,6 +173,37 @@ function MailWorkspace() {
     }
   };
 
+  // 5. Send composed email
+  const handleSendMail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!composeTo || !composeBody || !selectedAccountId) return;
+
+    setIsSending(true);
+    try {
+      const res = await vencore.invoke('/send-mail', {
+        accountId: selectedAccountId,
+        to: composeTo,
+        subject: composeSubject || '(No Subject)',
+        body: composeBody
+      });
+
+      if (res && res.success) {
+        setShowComposeModal(false);
+        setComposeTo('');
+        setComposeSubject('');
+        setComposeBody('');
+        // Reload folders and messages so it displays in Sent folder
+        await loadFolders(selectedAccountId);
+      } else {
+        alert(`Failed to send email: ${res?.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      alert(`Error sending email: ${String(err)}`);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
   // Filter messages based on search query
   const filteredMessages = messages.filter(msg => {
     const query = searchQuery.toLowerCase();
@@ -197,6 +235,20 @@ function MailWorkspace() {
           </select>
           <button onClick={() => setShowAddModal(true)} style={addButton} title="Connect new account">+</button>
         </div>
+
+        {/* Compose Button */}
+        <button 
+          onClick={() => {
+            if (!selectedAccountId) {
+              alert('Please connect and select an account first!');
+              return;
+            }
+            setShowComposeModal(true);
+          }} 
+          style={composeBtn}
+        >
+          Compose Mail
+        </button>
 
         {/* Folders List */}
         <div style={foldersList}>
@@ -364,6 +416,52 @@ function MailWorkspace() {
           </div>
         </div>
       )}
+
+      {/* Compose Modal */}
+      {showComposeModal && (
+        <div style={modalBackdrop}>
+          <div style={{ ...modalCard, width: 500 }}>
+            <h3 style={modalTitle}>New Message</h3>
+            <form onSubmit={handleSendMail} style={modalForm}>
+              <label style={modalLabel}>To</label>
+              <input
+                type="email"
+                required
+                value={composeTo}
+                onChange={e => setComposeTo(e.target.value)}
+                placeholder="recipient@example.com"
+                style={modalInput}
+              />
+
+              <label style={modalLabel}>Subject</label>
+              <input
+                type="text"
+                value={composeSubject}
+                onChange={e => setComposeSubject(e.target.value)}
+                placeholder="Email subject"
+                style={modalInput}
+              />
+
+              <label style={modalLabel}>Message</label>
+              <textarea
+                required
+                rows={10}
+                value={composeBody}
+                onChange={e => setComposeBody(e.target.value)}
+                placeholder="Write your email body here..."
+                style={{ ...modalInput, fontFamily: 'inherit', resize: 'vertical' }}
+              />
+
+              <div style={modalActions}>
+                <button type="button" onClick={() => setShowComposeModal(false)} style={modalCancelBtn}>Cancel</button>
+                <button type="submit" disabled={isSending} style={modalSubmitBtn}>
+                  {isSending ? 'Sending...' : 'Send Email'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -371,9 +469,10 @@ function MailWorkspace() {
 // Styling Constants (Inline CSS for iframe sandbox environment)
 const container: React.CSSProperties = { display: 'flex', height: '100vh', background: 'var(--bg)', fontFamily: 'DM Sans, sans-serif', overflow: 'hidden' };
 const sidebar: React.CSSProperties = { width: 230, borderRight: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', flexDirection: 'column', padding: 16, flexShrink: 0 };
-const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 8, marginBottom: 20 };
+const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 8, marginBottom: 12 };
 const accountSelector: React.CSSProperties = { flex: 1, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
 const addButton: React.CSSProperties = { width: 30, height: 30, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', cursor: 'pointer', fontSize: 16, fontWeight: 700 };
+const composeBtn: React.CSSProperties = { width: '100%', padding: '10px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 20, textAlign: 'center', transition: 'opacity 0.15s ease' };
 const foldersList: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, flex: 1 };
 const folderTab: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', textAlign: 'left', fontSize: 13, color: 'var(--text)' };
 const unreadBadge: React.CSSProperties = { background: 'var(--blue)', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 999 };
