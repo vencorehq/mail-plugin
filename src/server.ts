@@ -16,12 +16,20 @@ export default {
     // 2. Register HTTP endpoint to fetch mail body dynamically
     vencore.http.onEndpoint('/fetch-body', async (req: any) => {
       try {
-        const { accountId, messageId } = req;
+        const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+        const { accountId, messageId } = payload;
+
         const body = await fetchMessageBodyFromSource(vencore, accountId, messageId);
-        return { success: true, body };
+        return {
+          status: 200,
+          body: { success: true, body }
+        };
       } catch (err) {
         console.error('Failed to fetch message body:', err);
-        return { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+        return {
+          status: 500,
+          body: { success: false, error: err instanceof Error ? err.message : 'Unknown error' }
+        };
       }
     });
 
@@ -29,17 +37,24 @@ export default {
     vencore.http.onEndpoint('/sync-now', async () => {
       try {
         await syncAllAccounts(vencore);
-        return { success: true };
+        return {
+          status: 200,
+          body: { success: true }
+        };
       } catch (err) {
         console.error('Manual sync failed:', err);
-        return { success: false, error: String(err) };
+        return {
+          status: 500,
+          body: { success: false, error: String(err) }
+        };
       }
     });
 
     // 4. Register HTTP endpoint to send a new email
     vencore.http.onEndpoint('/send-mail', async (req: any) => {
       try {
-        const { accountId, to, subject, body } = req;
+        const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+        const { accountId, to, subject, body } = payload;
 
         // Fetch account details
         const account = (await vencore.table('mail_accounts').get(accountId)) as MailAccount;
@@ -98,10 +113,16 @@ export default {
           });
         }
 
-        return { success: true };
+        return {
+          status: 200,
+          body: { success: true }
+        };
       } catch (err) {
         console.error('Failed to send mail:', err);
-        return { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+        return {
+          status: 500,
+          body: { success: false, error: err instanceof Error ? err.message : 'Unknown error' }
+        };
       }
     });
   }
