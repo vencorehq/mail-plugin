@@ -102,7 +102,7 @@ export default {
           date: new Date().toISOString(),
           snippet: body.slice(0, 100),
           is_read: true,
-          flags: JSON.stringify([])
+          flags: [] // Passed as native JS array for jsonb column
         });
 
         // Increment total count in the Sent folder
@@ -185,7 +185,7 @@ async function syncAccount(vencore: any, account: MailAccount) {
         date: msg.date,
         snippet: msg.snippet,
         is_read: msg.is_read,
-        flags: JSON.stringify(msg.flags)
+        flags: msg.flags // Passed as native JS array for jsonb column
       }, { on_conflict: 'external_id' });
     }
   }
