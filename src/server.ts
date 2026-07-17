@@ -13,34 +13,26 @@ export default {
       }
     });
 
-    // 2. Listen for on-demand fetch requests from the frontend client to get message body
-    vencore.bus.on('mail:fetch_body_request', async (payload: { messageId: string; accountId: string; replyEvent: string }) => {
+    // 2. Register HTTP endpoint to fetch mail body dynamically
+    vencore.http.onEndpoint('/fetch-body', async (req: any) => {
       try {
-        const body = await fetchMessageBodyFromSource(vencore, payload.accountId, payload.messageId);
-        vencore.bus.emit(payload.replyEvent, { success: true, body });
+        const { accountId, messageId } = req;
+        const body = await fetchMessageBodyFromSource(vencore, accountId, messageId);
+        return { success: true, body };
       } catch (err) {
-        console.error('Failed to fetch message body on-demand:', err);
-        vencore.bus.emit(payload.replyEvent, { success: false, error: err instanceof Error ? err.message : 'Unknown error' });
+        console.error('Failed to fetch message body:', err);
+        return { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
       }
     });
 
-    // 3. Listen for manual sync trigger
-    vencore.bus.on('mail:sync_now_request', async (payload: { replyEvent: string }) => {
+    // 3. Register HTTP endpoint to trigger manual inbox sync
+    vencore.http.onEndpoint('/sync-now', async () => {
       try {
         await syncAllAccounts(vencore);
-        vencore.bus.emit(payload.replyEvent, { success: true });
+        return { success: true };
       } catch (err) {
-        vencore.bus.emit(payload.replyEvent, { success: false, error: String(err) });
-      }
-    });
-
-    // 4. Listen for folder configuration updates
-    vencore.bus.on('mail:mark_read_request', async (payload: { messageId: string; isRead: boolean }) => {
-      try {
-        await vencore.table('mail_messages').update(payload.messageId, { is_read: payload.isRead });
-        vencore.bus.emit('mail:message_updated', { messageId: payload.messageId, isRead: payload.isRead });
-      } catch (err) {
-        console.error('Failed to update message flags:', err);
+        console.error('Manual sync failed:', err);
+        return { success: false, error: String(err) };
       }
     });
   }

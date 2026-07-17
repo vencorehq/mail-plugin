@@ -35,25 +35,7 @@ function MailWorkspace() {
   // 1. Initial Load: Fetch Accounts
   useEffect(() => {
     loadAccounts();
-    
-    // Listen for sync completions from backend
-    vencore.bus.on('mail:sync_completed', ({ accountId }: { accountId: string }) => {
-      console.log(`Sync completed for account: ${accountId}`);
-      setIsSyncing(false);
-      loadAccounts();
-      if (accountId === selectedAccountId) {
-        loadFolders(accountId);
-      }
-    });
-
-    // Listen for single message updates
-    vencore.bus.on('mail:message_updated', ({ messageId, isRead }: { messageId: string; isRead: boolean }) => {
-      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, is_read: isRead } : m));
-      if (selectedMsg && selectedMsg.id === messageId) {
-        setSelectedMsg(prev => prev ? { ...prev, is_read: isRead } : null);
-      }
-    });
-  }, [selectedAccountId, selectedMsg]);
+  }, []);
 
   const loadAccounts = async () => {
     try {
@@ -102,40 +84,58 @@ function MailWorkspace() {
     setMsgBody('');
     setLoadingBody(true);
 
-    // If message is unread, mark it as read in the DB
+    // If message is unread, mark it as read in the DB directly
     if (!msg.is_read) {
-      vencore.bus.emit('mail:mark_read_request', { messageId: msg.id, isRead: true });
+      try {
+        await vencore.table('mail_messages').update(msg.id, { is_read: true });
+        // Update local state arrays to clear unread badges instantly
+        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, is_read: true } : m));
+        setFolders(prev => prev.map(f => f.id === msg.folder_id ? { ...f, unread_count: Math.max(0, f.unread_count - 1) } : f));
+      } catch (err) {
+        console.error('Failed to update message flags:', err);
+      }
     }
 
-    const replyEvent = `mail:body_received_${msg.id}_${Date.now()}`;
-    vencore.bus.on(replyEvent, (payload: { success: boolean; body?: string; error?: string }) => {
-      setLoadingBody(false);
-      if (payload.success && payload.body) {
-        setMsgBody(payload.body);
-      } else {
-        setMsgBody(`<p style="color:red; padding:16px;">Failed to load email: ${payload.error || 'Unknown error'}</p>`);
-      }
-    });
+    try {
+      // Invoke HTTP endpoint in sandbox to retrieve message body dynamically
+      const res = await vencore.invoke('/fetch-body', {
+        messageId: msg.id,
+        accountId: selectedAccountId
+      });
 
-    // Request full body from backend process
-    vencore.bus.emit('mail:fetch_body_request', {
-      messageId: msg.id,
-      accountId: selectedAccountId,
-      replyEvent
-    });
+      if (res && res.success && res.body) {
+        setMsgBody(res.body);
+      } else {
+        setMsgBody(`<p style="color:red; padding:16px;">Failed to load email: ${res?.error || 'Unknown error'}</p>`);
+      }
+    } catch (err) {
+      setMsgBody(`<p style="color:red; padding:16px;">Failed to load email: ${String(err)}</p>`);
+    } finally {
+      setLoadingBody(false);
+    }
   };
 
   // 3. Trigger manual sync request
-  const handleSyncNow = () => {
+  const handleSyncNow = async () => {
     setIsSyncing(true);
-    const replyEvent = `mail:sync_now_response_${Date.now()}`;
-    vencore.bus.on(replyEvent, (payload: { success: boolean; error?: string }) => {
-      if (!payload.success) {
-        alert(`Sync failed: ${payload.error}`);
-        setIsSyncing(false);
+    try {
+      const res = await vencore.invoke('/sync-now');
+      if (res && res.success) {
+        await loadAccounts();
+        if (selectedAccountId) {
+          await loadFolders(selectedAccountId);
+          if (selectedFolderId) {
+            await loadMessages(selectedFolderId);
+          }
+        }
+      } else {
+        alert(`Sync failed: ${res?.error || 'Unknown error'}`);
       }
-    });
-    vencore.bus.emit('mail:sync_now_request', { replyEvent });
+    } catch (err) {
+      alert(`Sync failed: ${String(err)}`);
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   // 4. Create new mail account
@@ -160,7 +160,7 @@ function MailWorkspace() {
       setNewAccEmail('');
       setNewAccHost('');
       setNewAccPassword('');
-      loadAccounts();
+      await loadAccounts();
     } catch (err) {
       alert('Failed to connect account: ' + err);
     }
