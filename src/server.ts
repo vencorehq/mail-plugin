@@ -36,6 +36,14 @@ export default {
     // 3. Register HTTP endpoint to trigger manual inbox sync
     vencore.http.onEndpoint('/sync-now', async () => {
       try {
+        // Automatically recover any accounts previously locked in an error state
+        const accounts = (await vencore.table('mail_accounts').list()) as MailAccount[];
+        for (const account of accounts) {
+          if (account.status === 'error') {
+            await vencore.table('mail_accounts').update(account.id, { status: 'active' });
+          }
+        }
+
         await syncAllAccounts(vencore);
         return {
           status: 200,
@@ -139,7 +147,7 @@ async function syncAllAccounts(vencore: any) {
       await syncAccount(vencore, account);
     } catch (err) {
       console.error(`Failed to sync account: ${account.email}`, err);
-      await vencore.table('mail_accounts').update(account.id, { status: 'error' });
+      // Log the error but don't lock the account in 'error' state permanently
     }
   }
 }
@@ -175,18 +183,32 @@ async function syncAccount(vencore: any, account: MailAccount) {
     // Fetch and sync new messages in this folder (delta sync)
     const messages = await fetchNewMessagesFromSource(account, folder, folderId);
     for (const msg of messages) {
-      await vencore.table('mail_messages').upsert({
-        account_id: account.id,
-        folder_id: folderId,
-        external_id: msg.external_id,
-        subject: msg.subject,
-        sender: msg.sender,
-        recipient: msg.recipient,
-        date: msg.date,
-        snippet: msg.snippet,
-        is_read: msg.is_read,
-        flags: msg.flags // Passed as native JS array for jsonb column
-      }, { on_conflict: 'external_id' });
+      // Manual JS/TS check-and-upsert to avoid SQL index constraint warnings
+      const existing = await vencore.table('mail_messages').list({
+        where: { external_id: msg.external_id }
+      }) as MailMessage[];
+
+      if (existing.length > 0) {
+        await vencore.table('mail_messages').update(existing[0].id, {
+          subject: msg.subject,
+          snippet: msg.snippet,
+          is_read: msg.is_read,
+          flags: msg.flags
+        });
+      } else {
+        await vencore.table('mail_messages').insert({
+          account_id: account.id,
+          folder_id: folderId,
+          external_id: msg.external_id,
+          subject: msg.subject,
+          sender: msg.sender,
+          recipient: msg.recipient,
+          date: msg.date,
+          snippet: msg.snippet,
+          is_read: msg.is_read,
+          flags: msg.flags // Passed as native JS array for jsonb column
+        });
+      }
     }
   }
 
