@@ -16,7 +16,7 @@ function MailWorkspace() {
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
   const [folders, setFolders] = useState<MailFolder[]>([]);
-  const [selectedFolderId, setSelectedFolderId] = useState<string>('');
+  const [selectedFolderId, setSelectedFolderId] = useState<string>('all'); // 'all', 'starred', or folder.id
   const [messages, setMessages] = useState<MailMessage[]>([]);
   const [selectedMsg, setSelectedMsg] = useState<MailMessage | null>(null);
   const [msgBody, setMsgBody] = useState<string>('');
@@ -32,7 +32,7 @@ function MailWorkspace() {
   const [newAccPort, setNewAccPort] = useState<number>(993);
   const [newAccPassword, setNewAccPassword] = useState<string>('');
 
-  // Compose email modal state
+  // Compose / Reply / Forward email modal state
   const [showComposeModal, setShowComposeModal] = useState<boolean>(false);
   const [composeTo, setComposeTo] = useState<string>('');
   const [composeSubject, setComposeSubject] = useState<string>('');
@@ -62,12 +62,17 @@ function MailWorkspace() {
       const data = (await vencore.table('mail_folders').list({ where: { account_id: accountId } })) as MailFolder[];
       setFolders(data);
       if (data.length > 0) {
-        setSelectedFolderId(data[0].id);
-        loadMessages(data[0].id);
+        if (selectedFolderId === 'all') {
+          loadMessages(data[0].id);
+          setSelectedFolderId(data[0].id);
+        } else if (selectedFolderId !== 'starred') {
+          loadMessages(selectedFolderId);
+        } else {
+          loadStarredMessages(accountId);
+        }
       } else {
         setFolders([]);
         setMessages([]);
-        setSelectedFolderId('');
       }
     } catch (err) {
       console.error('Failed to load folders:', err);
@@ -77,7 +82,6 @@ function MailWorkspace() {
   const loadMessages = async (folderId: string) => {
     try {
       const data = (await vencore.table('mail_messages').list({ where: { folder_id: folderId } })) as MailMessage[];
-      // Sort messages descending by date
       const sorted = data.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
       setMessages(sorted);
     } catch (err) {
@@ -85,17 +89,26 @@ function MailWorkspace() {
     }
   };
 
-  // 2. Fetch Mail Body Dynamically (On-Demand) to keep local storage lightweight
+  const loadStarredMessages = async (accountId: string) => {
+    try {
+      const data = (await vencore.table('mail_messages').list({ where: { account_id: accountId } })) as MailMessage[];
+      const starred = data.filter(m => Array.isArray(m.flags) && m.flags.includes('STARRED'));
+      const sorted = starred.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      setMessages(sorted);
+    } catch (err) {
+      console.error('Failed to load starred messages:', err);
+    }
+  };
+
+  // 2. Select Message and Fetch Body Dynamically
   const handleSelectMessage = async (msg: MailMessage) => {
     setSelectedMsg(msg);
     setMsgBody('');
     setLoadingBody(true);
 
-    // If message is unread, mark it as read in the DB directly
     if (!msg.is_read) {
       try {
         await vencore.table('mail_messages').update(msg.id, { is_read: true });
-        // Update local state arrays to clear unread badges instantly
         setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, is_read: true } : m));
         setFolders(prev => prev.map(f => f.id === msg.folder_id ? { ...f, unread_count: Math.max(0, f.unread_count - 1) } : f));
       } catch (err) {
@@ -104,7 +117,6 @@ function MailWorkspace() {
     }
 
     try {
-      // Invoke HTTP endpoint in sandbox to retrieve message body dynamically
       const res = await vencore.invoke('/fetch-body', {
         messageId: msg.id,
         accountId: selectedAccountId
@@ -122,7 +134,7 @@ function MailWorkspace() {
     }
   };
 
-  // 3. Trigger manual sync request
+  // 3. Trigger manual sync
   const handleSyncNow = async () => {
     setIsSyncing(true);
     try {
@@ -131,9 +143,6 @@ function MailWorkspace() {
         await loadAccounts();
         if (selectedAccountId) {
           await loadFolders(selectedAccountId);
-          if (selectedFolderId) {
-            await loadMessages(selectedFolderId);
-          }
         }
       } else {
         alert(`Sync failed: ${res?.error || 'Unknown error'}`);
@@ -173,7 +182,24 @@ function MailWorkspace() {
     }
   };
 
-  // 5. Send composed email
+  // 5. Delete Account
+  const handleDeleteAccount = async () => {
+    if (!selectedAccountId) return;
+    if (!confirm('Are you sure you want to disconnect this email account? All local folders and messages will be removed.')) return;
+
+    try {
+      await vencore.invoke('/delete-account', { accountId: selectedAccountId });
+      setSelectedAccountId('');
+      setSelectedMsg(null);
+      setFolders([]);
+      setMessages([]);
+      await loadAccounts();
+    } catch (err) {
+      alert('Failed to disconnect account: ' + err);
+    }
+  };
+
+  // 6. Send Composed / Replied / Forwarded Email
   const handleSendMail = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!composeTo || !composeBody || !selectedAccountId) return;
@@ -192,7 +218,6 @@ function MailWorkspace() {
         setComposeTo('');
         setComposeSubject('');
         setComposeBody('');
-        // Reload folders and messages so it displays in Sent folder
         await loadFolders(selectedAccountId);
       } else {
         alert(`Failed to send email: ${res?.error || 'Unknown error'}`);
@@ -204,6 +229,76 @@ function MailWorkspace() {
     }
   };
 
+  // 7. Toggle Star Status
+  const handleToggleStar = async (msg: MailMessage, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    try {
+      const res = await vencore.invoke('/toggle-star', { messageId: msg.id });
+      if (res && res.success) {
+        const nextStarred = res.isStarred;
+        setMessages(prev => prev.map(m => {
+          if (m.id === msg.id) {
+            const currentFlags = Array.isArray(m.flags) ? m.flags : [];
+            const updatedFlags = nextStarred
+              ? [...currentFlags, 'STARRED']
+              : currentFlags.filter(f => f !== 'STARRED');
+            return { ...m, flags: updatedFlags };
+          }
+          return m;
+        }));
+
+        if (selectedMsg?.id === msg.id) {
+          const currentFlags = Array.isArray(selectedMsg.flags) ? selectedMsg.flags : [];
+          const updatedFlags = nextStarred
+            ? [...currentFlags, 'STARRED']
+            : currentFlags.filter(f => f !== 'STARRED');
+          setSelectedMsg({ ...selectedMsg, flags: updatedFlags });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to toggle star:', err);
+    }
+  };
+
+  // 8. Delete / Move to Trash
+  const handleDeleteMessage = async (msg: MailMessage, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    try {
+      const res = await vencore.invoke('/delete-message', {
+        messageId: msg.id,
+        accountId: selectedAccountId
+      });
+
+      if (res && res.success) {
+        setMessages(prev => prev.filter(m => m.id !== msg.id));
+        if (selectedMsg?.id === msg.id) {
+          setSelectedMsg(null);
+        }
+        await loadFolders(selectedAccountId);
+      }
+    } catch (err) {
+      alert('Failed to delete message: ' + err);
+    }
+  };
+
+  // 9. Open Reply Modal
+  const handleReply = () => {
+    if (!selectedMsg) return;
+    setComposeTo(selectedMsg.sender);
+    setComposeSubject(selectedMsg.subject.startsWith('Re:') ? selectedMsg.subject : `Re: ${selectedMsg.subject}`);
+    setComposeBody(`\n\n--- On ${new Date(selectedMsg.date).toLocaleString()}, ${selectedMsg.sender} wrote:\n> ${selectedMsg.snippet}`);
+    setShowComposeModal(true);
+  };
+
+  // 10. Open Forward Modal
+  const handleForward = () => {
+    if (!selectedMsg) return;
+    setComposeTo('');
+    setComposeSubject(selectedMsg.subject.startsWith('Fwd:') ? selectedMsg.subject : `Fwd: ${selectedMsg.subject}`);
+    setComposeBody(`\n\n---------- Forwarded message ---------\nFrom: ${selectedMsg.sender}\nDate: ${new Date(selectedMsg.date).toLocaleString()}\nSubject: ${selectedMsg.subject}\nTo: ${selectedMsg.recipient}\n\n${selectedMsg.snippet}`);
+    setShowComposeModal(true);
+  };
+
   // Filter messages based on search query
   const filteredMessages = messages.filter(msg => {
     const query = searchQuery.toLowerCase();
@@ -213,6 +308,22 @@ function MailWorkspace() {
       msg.snippet.toLowerCase().includes(query)
     );
   });
+
+  // Calculate sender initial & gradient for avatar badges
+  const getAvatarStyle = (name: string) => {
+    const gradients = [
+      'linear-gradient(135deg, #10b981, #059669)',
+      'linear-gradient(135deg, #6366f1, #4f46e5)',
+      'linear-gradient(135deg, #8b5cf6, #7c3aed)',
+      'linear-gradient(135deg, #ec4899, #db2777)',
+      'linear-gradient(135deg, #f59e0b, #d97706)',
+      'linear-gradient(135deg, #3b82f6, #2563eb)'
+    ];
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    const index = Math.abs(hash) % gradients.length;
+    return { background: gradients[index], color: '#fff' };
+  };
 
   return (
     <div style={container}>
@@ -234,6 +345,9 @@ function MailWorkspace() {
             {accounts.length === 0 && <option value="">No Accounts Linked</option>}
           </select>
           <button onClick={() => setShowAddModal(true)} style={addButton} title="Connect new account">+</button>
+          {selectedAccountId && (
+            <button onClick={handleDeleteAccount} style={deleteAccBtn} title="Disconnect selected account">✕</button>
+          )}
         </div>
 
         {/* Compose Button */}
@@ -243,15 +357,35 @@ function MailWorkspace() {
               alert('Please connect and select an account first!');
               return;
             }
+            setComposeTo('');
+            setComposeSubject('');
+            setComposeBody('');
             setShowComposeModal(true);
           }} 
           style={composeBtn}
         >
-          Compose Mail
+          ✏️ Compose Mail
         </button>
 
-        {/* Folders List */}
+        {/* Folders & Starred Navigation */}
         <div style={foldersList}>
+          <button
+            onClick={() => {
+              setSelectedFolderId('starred');
+              if (selectedAccountId) loadStarredMessages(selectedAccountId);
+              setSelectedMsg(null);
+            }}
+            style={{
+              ...folderTab,
+              background: selectedFolderId === 'starred' ? 'var(--surface2)' : 'transparent',
+              fontWeight: selectedFolderId === 'starred' ? 600 : 400
+            }}
+          >
+            <span>⭐ Starred</span>
+          </button>
+
+          <hr style={{ border: 0, borderTop: '1px solid var(--border)', margin: '6px 0' }} />
+
           {folders.map(folder => (
             <button
               key={folder.id}
@@ -275,7 +409,7 @@ function MailWorkspace() {
         </div>
 
         <button onClick={handleSyncNow} disabled={isSyncing} style={syncButton}>
-          {isSyncing ? 'Syncing...' : 'Sync Inbox Now'}
+          {isSyncing ? 'Syncing...' : '🔄 Sync Inbox Now'}
         </button>
       </aside>
 
@@ -292,28 +426,48 @@ function MailWorkspace() {
         </div>
 
         <div style={messagesList}>
-          {filteredMessages.map(msg => (
-            <div
-              key={msg.id}
-              onClick={() => handleSelectMessage(msg)}
-              style={{
-                ...messageCard,
-                background: selectedMsg?.id === msg.id ? 'var(--surface2)' : 'var(--surface)',
-                borderLeft: msg.is_read ? '3px solid transparent' : '3px solid var(--blue)'
-              }}
-            >
-              <div style={messageHeader}>
-                <span style={{ ...messageSender, fontWeight: msg.is_read ? 500 : 700 }}>
-                  {msg.sender.split(' <')[0]}
-                </span>
-                <span style={messageDate}>
-                  {new Date(msg.date).toLocaleDateString([], { month: 'short', day: 'numeric' })}
-                </span>
+          {filteredMessages.map(msg => {
+            const isStarred = Array.isArray(msg.flags) && msg.flags.includes('STARRED');
+            const senderName = msg.sender.split(' <')[0].replace(/"/g, '');
+            const initial = (senderName[0] || 'M').toUpperCase();
+
+            return (
+              <div
+                key={msg.id}
+                onClick={() => handleSelectMessage(msg)}
+                style={{
+                  ...messageCard,
+                  background: selectedMsg?.id === msg.id ? 'var(--surface2)' : 'var(--surface)',
+                  borderLeft: msg.is_read ? '3px solid transparent' : '3px solid var(--blue)'
+                }}
+              >
+                <div style={messageHeader}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ ...avatarBadge, ...getAvatarStyle(senderName) }}>
+                      {initial}
+                    </div>
+                    <span style={{ ...messageSender, fontWeight: msg.is_read ? 500 : 700 }}>
+                      {senderName}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <button
+                      onClick={e => handleToggleStar(msg, e)}
+                      style={starIconBtn}
+                      title={isStarred ? 'Unstar' : 'Star'}
+                    >
+                      {isStarred ? '⭐' : '☆'}
+                    </button>
+                    <span style={messageDate}>
+                      {new Date(msg.date).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                    </span>
+                  </div>
+                </div>
+                <div style={{ ...messageSubject, fontWeight: msg.is_read ? 400 : 600 }}>{msg.subject}</div>
+                <div style={messageSnippet}>{msg.snippet}</div>
               </div>
-              <div style={{ ...messageSubject, fontWeight: msg.is_read ? 400 : 600 }}>{msg.subject}</div>
-              <div style={messageSnippet}>{msg.snippet}</div>
-            </div>
-          ))}
+            );
+          })}
 
           {filteredMessages.length === 0 && (
             <div style={emptyState}>No messages in this folder.</div>
@@ -326,7 +480,23 @@ function MailWorkspace() {
         {selectedMsg ? (
           <div style={readerContent}>
             <div style={readerHeader}>
-              <h2 style={readerSubject}>{selectedMsg.subject}</h2>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                <h2 style={readerSubject}>{selectedMsg.subject}</h2>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={handleReply} style={readerActionBtn}>↩️ Reply</button>
+                  <button onClick={handleForward} style={readerActionBtn}>↪️ Forward</button>
+                  <button
+                    onClick={e => handleToggleStar(selectedMsg, e)}
+                    style={readerActionBtn}
+                  >
+                    {Array.isArray(selectedMsg.flags) && selectedMsg.flags.includes('STARRED') ? '⭐ Starred' : '☆ Star'}
+                  </button>
+                  <button onClick={e => handleDeleteMessage(selectedMsg, e)} style={readerDeleteBtn} title="Delete email">
+                    🗑️ Delete
+                  </button>
+                </div>
+              </div>
+
               <div style={readerMeta}>
                 <div>From: <strong>{selectedMsg.sender}</strong></div>
                 <div>To: {selectedMsg.recipient}</div>
@@ -417,10 +587,10 @@ function MailWorkspace() {
         </div>
       )}
 
-      {/* Compose Modal */}
+      {/* Compose / Reply / Forward Modal */}
       {showComposeModal && (
         <div style={modalBackdrop}>
-          <div style={{ ...modalCard, width: 500 }}>
+          <div style={{ ...modalCard, width: 520 }}>
             <h3 style={modalTitle}>New Message</h3>
             <form onSubmit={handleSendMail} style={modalForm}>
               <label style={modalLabel}>To</label>
@@ -466,13 +636,14 @@ function MailWorkspace() {
   );
 }
 
-// Styling Constants (Inline CSS for iframe sandbox environment)
+// Styling Constants
 const container: React.CSSProperties = { display: 'flex', height: '100vh', background: 'var(--bg)', fontFamily: 'DM Sans, sans-serif', overflow: 'hidden' };
 const sidebar: React.CSSProperties = { width: 230, borderRight: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', flexDirection: 'column', padding: 16, flexShrink: 0 };
-const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 8, marginBottom: 12 };
-const accountSelector: React.CSSProperties = { flex: 1, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
-const addButton: React.CSSProperties = { width: 30, height: 30, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', cursor: 'pointer', fontSize: 16, fontWeight: 700 };
-const composeBtn: React.CSSProperties = { width: '100%', padding: '10px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 20, textAlign: 'center', transition: 'opacity 0.15s ease' };
+const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' };
+const accountSelector: React.CSSProperties = { flex: 1, padding: '6px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 12, color: 'var(--text)' };
+const addButton: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', cursor: 'pointer', fontSize: 14, fontWeight: 700 };
+const deleteAccBtn: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer', fontSize: 12, fontWeight: 700 };
+const composeBtn: React.CSSProperties = { width: '100%', padding: '9px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 16, textAlign: 'center' };
 const foldersList: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, flex: 1 };
 const folderTab: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', textAlign: 'left', fontSize: 13, color: 'var(--text)' };
 const unreadBadge: React.CSSProperties = { background: 'var(--blue)', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 999 };
@@ -483,8 +654,10 @@ const searchBarContainer: React.CSSProperties = { padding: 16, borderBottom: '1p
 const searchInput: React.CSSProperties = { width: '100%', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
 const messagesList: React.CSSProperties = { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' };
 const messageCard: React.CSSProperties = { padding: '14px 16px', borderBottom: '1px solid var(--border)', cursor: 'pointer', transition: 'background 0.15s ease' };
-const messageHeader: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', marginBottom: 4 };
+const messageHeader: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' };
+const avatarBadge: React.CSSProperties = { width: 22, height: 22, borderRadius: 999, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 };
 const messageSender: React.CSSProperties = { fontSize: 13, color: 'var(--text)' };
+const starIconBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, padding: 0 };
 const messageDate: React.CSSProperties = { fontSize: 11, color: 'var(--text3)' };
 const messageSubject: React.CSSProperties = { fontSize: 13, color: 'var(--text)', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
 const messageSnippet: React.CSSProperties = { fontSize: 12, color: 'var(--text2)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' };
@@ -492,7 +665,9 @@ const messageSnippet: React.CSSProperties = { fontSize: 12, color: 'var(--text2)
 const readerCol: React.CSSProperties = { flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--surface)' };
 const readerContent: React.CSSProperties = { display: 'flex', flexDirection: 'column', height: '100%' };
 const readerHeader: React.CSSProperties = { padding: '24px 32px', borderBottom: '1px solid var(--border)' };
-const readerSubject: React.CSSProperties = { margin: '0 0 12px', fontSize: 20, fontWeight: 700, color: 'var(--text)', fontFamily: 'Instrument Serif, serif' };
+const readerSubject: React.CSSProperties = { margin: 0, fontSize: 20, fontWeight: 700, color: 'var(--text)', fontFamily: 'Instrument Serif, serif' };
+const readerActionBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--text)' };
+const readerDeleteBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 6, background: 'rgba(239,68,68,0.08)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: '#ef4444' };
 const readerMeta: React.CSSProperties = { fontSize: 13, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 4 };
 const readerDate: React.CSSProperties = { fontSize: 12, color: 'var(--text3)', marginTop: 2 };
 const readerBodyContainer: React.CSSProperties = { flex: 1, padding: 32, background: 'var(--bg)', display: 'flex' };

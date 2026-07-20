@@ -2,7 +2,7 @@ import type { MailAccount, MailFolder, MailMessage } from './types';
 
 export default {
   async setup(vencore: any) {
-    console.log('Initializing Vencore Mail Plugin...');
+    console.log('Initializing Vencore Mail Plugin v2...');
 
     // 1. Register cron job for delta mail synchronization (runs every 60 seconds)
     vencore.cron.register('*/1 * * * *', 'sync-mail', async () => {
@@ -58,7 +58,7 @@ export default {
       }
     });
 
-    // 4. Register HTTP endpoint to send a new email
+    // 4. Register HTTP endpoint to send or reply/forward a new email
     vencore.http.onEndpoint('/send-mail', async (req: any) => {
       try {
         const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -89,11 +89,11 @@ export default {
 
         const externalId = `sent_${Date.now()}_${accountId}`;
 
-        // Save the full body in key-value plugin storage (not the SQL DB table) to keep relational DB light
+        // Save full body in key-value plugin storage (keeps relational SQL tables lightweight)
         await vencore.storage.set(`body:${externalId}`, `
           <div style="font-family: sans-serif; padding: 20px; line-height: 1.6;">
-            <p><strong>To:</strong> ${to}</p>
-            <p><strong>From:</strong> ${account.email}</p>
+            <p style="margin:0 0 4px;"><strong>To:</strong> ${to}</p>
+            <p style="margin:0 0 16px;"><strong>From:</strong> ${account.email}</p>
             <hr style="border: 0; border-top: 1px solid #eee; margin: 16px 0;" />
             <div style="white-space: pre-wrap;">${body}</div>
           </div>
@@ -110,10 +110,10 @@ export default {
           date: new Date().toISOString(),
           snippet: body.slice(0, 100),
           is_read: true,
-          flags: [] // Passed as native JS array for jsonb column
+          flags: []
         });
 
-        // Increment total count in the Sent folder
+        // Increment total count in Sent folder
         const folder = await vencore.table('mail_folders').get(sentFolderId) as MailFolder;
         if (folder) {
           await vencore.table('mail_folders').update(sentFolderId, {
@@ -133,6 +133,110 @@ export default {
         };
       }
     });
+
+    // 5. Register HTTP endpoint to toggle message star/flag status
+    vencore.http.onEndpoint('/toggle-star', async (req: any) => {
+      try {
+        const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+        const { messageId } = payload;
+
+        const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
+        if (!msg) throw new Error('Message not found');
+
+        const currentFlags: string[] = Array.isArray(msg.flags) ? msg.flags : [];
+        const isStarred = currentFlags.includes('STARRED');
+        const nextFlags = isStarred
+          ? currentFlags.filter(f => f !== 'STARRED')
+          : [...currentFlags, 'STARRED'];
+
+        await vencore.table('mail_messages').update(messageId, {
+          flags: nextFlags
+        });
+
+        return {
+          status: 200,
+          body: { success: true, isStarred: !isStarred }
+        };
+      } catch (err) {
+        return {
+          status: 500,
+          body: { success: false, error: String(err) }
+        };
+      }
+    });
+
+    // 6. Register HTTP endpoint to delete or move message to Trash
+    vencore.http.onEndpoint('/delete-message', async (req: any) => {
+      try {
+        const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+        const { messageId, accountId } = payload;
+
+        const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
+        if (!msg) throw new Error('Message not found');
+
+        const currentFolder = (await vencore.table('mail_folders').get(msg.folder_id)) as MailFolder;
+        
+        // If already in trash, permanently delete from DB
+        if (currentFolder && currentFolder.type === 'trash') {
+          await vencore.table('mail_messages').delete(messageId);
+          return { status: 200, body: { success: true, action: 'purged' } };
+        }
+
+        // Otherwise, move to Trash folder
+        const trashFolders = (await vencore.table('mail_folders').list({
+          where: { account_id: accountId, type: 'trash' }
+        })) as MailFolder[];
+
+        let trashFolderId = '';
+        if (trashFolders.length > 0) {
+          trashFolderId = trashFolders[0].id;
+        } else {
+          const created = await vencore.table('mail_folders').insert({
+            account_id: accountId,
+            name: 'Trash',
+            type: 'trash',
+            unread_count: 0,
+            total_count: 0
+          });
+          trashFolderId = created.id as string;
+        }
+
+        await vencore.table('mail_messages').update(messageId, {
+          folder_id: trashFolderId
+        });
+
+        return { status: 200, body: { success: true, action: 'moved_to_trash' } };
+      } catch (err) {
+        return { status: 500, body: { success: false, error: String(err) } };
+      }
+    });
+
+    // 7. Register HTTP endpoint to disconnect/delete an email account
+    vencore.http.onEndpoint('/delete-account', async (req: any) => {
+      try {
+        const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+        const { accountId } = payload;
+
+        // Delete all messages
+        const msgs = (await vencore.table('mail_messages').list({ where: { account_id: accountId } })) as MailMessage[];
+        for (const m of msgs) {
+          await vencore.table('mail_messages').delete(m.id);
+        }
+
+        // Delete all folders
+        const fds = (await vencore.table('mail_folders').list({ where: { account_id: accountId } })) as MailFolder[];
+        for (const f of fds) {
+          await vencore.table('mail_folders').delete(f.id);
+        }
+
+        // Delete account
+        await vencore.table('mail_accounts').delete(accountId);
+
+        return { status: 200, body: { success: true } };
+      } catch (err) {
+        return { status: 500, body: { success: false, error: String(err) } };
+      }
+    });
   }
 };
 
@@ -147,7 +251,6 @@ async function syncAllAccounts(vencore: any) {
       await syncAccount(vencore, account);
     } catch (err) {
       console.error(`Failed to sync account: ${account.email}`, err);
-      // Log the error but don't lock the account in 'error' state permanently
     }
   }
 }
@@ -183,7 +286,7 @@ async function syncAccount(vencore: any, account: MailAccount) {
     // Fetch and sync new messages in this folder (delta sync)
     const messages = await fetchNewMessagesFromSource(account, folder, folderId);
     for (const msg of messages) {
-      // Manual JS/TS check-and-upsert to avoid SQL index constraint warnings
+      // Manual check-and-upsert to avoid DB index requirement
       const existing = await vencore.table('mail_messages').list({
         where: { external_id: msg.external_id }
       }) as MailMessage[];
@@ -206,7 +309,7 @@ async function syncAccount(vencore: any, account: MailAccount) {
           date: msg.date,
           snippet: msg.snippet,
           is_read: msg.is_read,
-          flags: msg.flags // Passed as native JS array for jsonb column
+          flags: msg.flags
         });
       }
     }
@@ -219,7 +322,6 @@ async function syncAccount(vencore: any, account: MailAccount) {
 // Mock/Fetch helper to simulate Gmail and IMAP fetching folders
 async function fetchFoldersFromSource(account: MailAccount): Promise<Omit<MailFolder, 'id' | 'account_id'>[]> {
   if (account.type === 'gmail') {
-    // Simulated Gmail Labels
     return [
       { name: 'INBOX', type: 'inbox', unread_count: 3, total_count: 10 },
       { name: 'SENT', type: 'sent', unread_count: 0, total_count: 5 },
@@ -227,7 +329,6 @@ async function fetchFoldersFromSource(account: MailAccount): Promise<Omit<MailFo
       { name: 'TRASH', type: 'trash', unread_count: 0, total_count: 2 }
     ];
   } else {
-    // Simulated IMAP Folders
     return [
       { name: 'Inbox', type: 'inbox', unread_count: 5, total_count: 15 },
       { name: 'Sent Messages', type: 'sent', unread_count: 0, total_count: 10 },
@@ -284,7 +385,6 @@ async function fetchNewMessagesFromSource(
       ];
     }
   } else {
-    // IMAP Mock messages
     if (folder.type === 'inbox') {
       return [
         {
@@ -306,11 +406,9 @@ async function fetchNewMessagesFromSource(
 
 // Fetch mail message HTML/plain text body on-demand (keeps DB light)
 async function fetchMessageBodyFromSource(vencore: any, accountId: string, messageId: string): Promise<string> {
-  // Pull message metadata from DB to check type
   const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
   if (!msg) throw new Error('Message not found');
 
-  // Check if this is a custom sent message stored in the key-value storage
   const storedBody = await vencore.storage.get(`body:${msg.external_id}`);
   if (storedBody) return storedBody;
 
