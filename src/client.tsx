@@ -92,7 +92,13 @@ function MailWorkspace() {
   const loadStarredMessages = async (accountId: string) => {
     try {
       const data = (await vencore.table('mail_messages').list({ where: { account_id: accountId } })) as MailMessage[];
-      const starred = data.filter(m => Array.isArray(m.flags) && m.flags.includes('STARRED'));
+      const starred = data.filter(m => {
+        const flags = m.flags;
+        const currentFlags: string[] = typeof flags === 'string'
+          ? JSON.parse(flags)
+          : Array.isArray(flags) ? flags : [];
+        return currentFlags.includes('STARRED');
+      });
       const sorted = starred.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
       setMessages(sorted);
     } catch (err) {
@@ -238,17 +244,21 @@ function MailWorkspace() {
         const nextStarred = res.isStarred;
         setMessages(prev => prev.map(m => {
           if (m.id === msg.id) {
-            const currentFlags = Array.isArray(m.flags) ? m.flags : [];
+            const currentFlags: string[] = typeof m.flags === 'string'
+              ? JSON.parse(m.flags)
+              : Array.isArray(m.flags) ? m.flags : [];
             const updatedFlags = nextStarred
               ? [...currentFlags, 'STARRED']
               : currentFlags.filter(f => f !== 'STARRED');
-            return { ...m, flags: updatedFlags };
+            return { ...m, flags: updatedFlags }; // Saved locally as array to match typescript type
           }
           return m;
         }));
 
         if (selectedMsg?.id === msg.id) {
-          const currentFlags = Array.isArray(selectedMsg.flags) ? selectedMsg.flags : [];
+          const currentFlags: string[] = typeof selectedMsg.flags === 'string'
+            ? JSON.parse(selectedMsg.flags)
+            : Array.isArray(selectedMsg.flags) ? selectedMsg.flags : [];
           const updatedFlags = nextStarred
             ? [...currentFlags, 'STARRED']
             : currentFlags.filter(f => f !== 'STARRED');
@@ -297,6 +307,15 @@ function MailWorkspace() {
     setComposeSubject(selectedMsg.subject.startsWith('Fwd:') ? selectedMsg.subject : `Fwd: ${selectedMsg.subject}`);
     setComposeBody(`\n\n---------- Forwarded message ---------\nFrom: ${selectedMsg.sender}\nDate: ${new Date(selectedMsg.date).toLocaleString()}\nSubject: ${selectedMsg.subject}\nTo: ${selectedMsg.recipient}\n\n${selectedMsg.snippet}`);
     setShowComposeModal(true);
+  };
+
+  // Helper to parse flags securely
+  const isMessageStarred = (msg: MailMessage) => {
+    const rawFlags = msg.flags;
+    const currentFlags: string[] = typeof rawFlags === 'string'
+      ? JSON.parse(rawFlags)
+      : Array.isArray(rawFlags) ? rawFlags : [];
+    return currentFlags.includes('STARRED');
   };
 
   // Filter messages based on search query
@@ -364,7 +383,7 @@ function MailWorkspace() {
           }} 
           style={composeBtn}
         >
-          ✏️ Compose Mail
+          Compose Mail
         </button>
 
         {/* Folders & Starred Navigation */}
@@ -381,7 +400,7 @@ function MailWorkspace() {
               fontWeight: selectedFolderId === 'starred' ? 600 : 400
             }}
           >
-            <span>⭐ Starred</span>
+            <span>Starred</span>
           </button>
 
           <hr style={{ border: 0, borderTop: '1px solid var(--border)', margin: '6px 0' }} />
@@ -409,7 +428,7 @@ function MailWorkspace() {
         </div>
 
         <button onClick={handleSyncNow} disabled={isSyncing} style={syncButton}>
-          {isSyncing ? 'Syncing...' : '🔄 Sync Inbox Now'}
+          {isSyncing ? 'Syncing...' : 'Sync Inbox Now'}
         </button>
       </aside>
 
@@ -427,7 +446,7 @@ function MailWorkspace() {
 
         <div style={messagesList}>
           {filteredMessages.map(msg => {
-            const isStarred = Array.isArray(msg.flags) && msg.flags.includes('STARRED');
+            const isStarred = isMessageStarred(msg);
             const senderName = msg.sender.split(' <')[0].replace(/"/g, '');
             const initial = (senderName[0] || 'M').toUpperCase();
 
@@ -456,7 +475,7 @@ function MailWorkspace() {
                       style={starIconBtn}
                       title={isStarred ? 'Unstar' : 'Star'}
                     >
-                      {isStarred ? '⭐' : '☆'}
+                      {isStarred ? '★' : '☆'}
                     </button>
                     <span style={messageDate}>
                       {new Date(msg.date).toLocaleDateString([], { month: 'short', day: 'numeric' })}
@@ -483,16 +502,16 @@ function MailWorkspace() {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
                 <h2 style={readerSubject}>{selectedMsg.subject}</h2>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <button onClick={handleReply} style={readerActionBtn}>↩️ Reply</button>
-                  <button onClick={handleForward} style={readerActionBtn}>↪️ Forward</button>
+                  <button onClick={handleReply} style={readerActionBtn}>Reply</button>
+                  <button onClick={handleForward} style={readerActionBtn}>Forward</button>
                   <button
                     onClick={e => handleToggleStar(selectedMsg, e)}
                     style={readerActionBtn}
                   >
-                    {Array.isArray(selectedMsg.flags) && selectedMsg.flags.includes('STARRED') ? '⭐ Starred' : '☆ Star'}
+                    {isMessageStarred(selectedMsg) ? 'Starred' : 'Star'}
                   </button>
                   <button onClick={e => handleDeleteMessage(selectedMsg, e)} style={readerDeleteBtn} title="Delete email">
-                    🗑️ Delete
+                    Delete
                   </button>
                 </div>
               </div>
@@ -641,9 +660,9 @@ const container: React.CSSProperties = { display: 'flex', height: '100vh', backg
 const sidebar: React.CSSProperties = { width: 230, borderRight: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', flexDirection: 'column', padding: 16, flexShrink: 0 };
 const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' };
 const accountSelector: React.CSSProperties = { flex: 1, padding: '6px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 12, color: 'var(--text)' };
-const addButton: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', cursor: 'pointer', fontSize: 14, fontWeight: 700 };
+const addButton: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', fontSize: 14, fontWeight: 700 };
 const deleteAccBtn: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer', fontSize: 12, fontWeight: 700 };
-const composeBtn: React.CSSProperties = { width: '100%', padding: '9px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 16, textAlign: 'center' };
+const composeBtn: React.CSSProperties = { width: '100%', padding: '9px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: 'var(--bg)', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 16, textAlign: 'center' };
 const foldersList: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, flex: 1 };
 const folderTab: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', textAlign: 'left', fontSize: 13, color: 'var(--text)' };
 const unreadBadge: React.CSSProperties = { background: 'var(--blue)', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 999 };
@@ -657,7 +676,7 @@ const messageCard: React.CSSProperties = { padding: '14px 16px', borderBottom: '
 const messageHeader: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' };
 const avatarBadge: React.CSSProperties = { width: 22, height: 22, borderRadius: 999, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 };
 const messageSender: React.CSSProperties = { fontSize: 13, color: 'var(--text)' };
-const starIconBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, padding: 0 };
+const starIconBtn: React.CSSProperties = { background: 'none', border: 'none', cursor: 'pointer', fontSize: 14, color: 'var(--text2)', padding: 0 };
 const messageDate: React.CSSProperties = { fontSize: 11, color: 'var(--text3)' };
 const messageSubject: React.CSSProperties = { fontSize: 13, color: 'var(--text)', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
 const messageSnippet: React.CSSProperties = { fontSize: 12, color: 'var(--text2)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' };
@@ -670,17 +689,17 @@ const readerActionBtn: React.CSSProperties = { padding: '6px 12px', border: '1px
 const readerDeleteBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 6, background: 'rgba(239,68,68,0.08)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: '#ef4444' };
 const readerMeta: React.CSSProperties = { fontSize: 13, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 4 };
 const readerDate: React.CSSProperties = { fontSize: 12, color: 'var(--text3)', marginTop: 2 };
-const readerBodyContainer: React.CSSProperties = { flex: 1, padding: 32, background: 'var(--bg)', display: 'flex' };
-const readerIframe: React.CSSProperties = { width: '100%', height: '100%', border: 'none', background: 'var(--surface)', borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.02)' };
+const readerBodyContainer: React.CSSProperties = { flex: 1, padding: '24px 32px', background: 'var(--bg)', display: 'flex' };
+const readerIframe: React.CSSProperties = { width: '100%', height: '100%', border: '1px solid var(--border)', background: '#ffffff', color: '#111111', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.03)' };
 const bodyLoader: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%', color: 'var(--text3)', fontSize: 14 };
 const emptyState: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text3)', fontSize: 14 };
 
-const modalBackdrop: React.CSSProperties = { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 };
-const modalCard: React.CSSProperties = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, width: 400, padding: 24, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' };
+const modalBackdrop: React.CSSProperties = { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 };
+const modalCard: React.CSSProperties = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, width: 400, padding: 24, boxShadow: '0 8px 24px rgba(0,0,0,0.15)' };
 const modalTitle: React.CSSProperties = { margin: '0 0 16px', fontSize: 16, fontWeight: 700, color: 'var(--text)' };
 const modalForm: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 12 };
 const modalLabel: React.CSSProperties = { fontSize: 12, fontWeight: 500, color: 'var(--text2)', marginBottom: -6 };
 const modalInput: React.CSSProperties = { padding: '8px 12px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
 const modalActions: React.CSSProperties = { display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 12 };
 const modalCancelBtn: React.CSSProperties = { padding: '8px 16px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface)', cursor: 'pointer', fontSize: 13, color: 'var(--text)' };
-const modalSubmitBtn: React.CSSProperties = { padding: '8px 16px', border: 'none', borderRadius: 6, background: 'var(--text)', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500 };
+const modalSubmitBtn: React.CSSProperties = { padding: '8px 16px', border: 'none', borderRadius: 6, background: 'var(--text)', color: 'var(--bg)', cursor: 'pointer', fontSize: 13, fontWeight: 500 };
