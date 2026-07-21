@@ -1,8 +1,23 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import type { MailAccount, MailFolder, MailMessage } from './types';
 
 // Module-scoped vencore reference passed down by the host runtime on setup
 let vencore: any;
+
+const getAvatarStyle = (name: string) => {
+  const gradients = [
+    'linear-gradient(135deg, #10b981, #059669)',
+    'linear-gradient(135deg, #6366f1, #4f46e5)',
+    'linear-gradient(135deg, #8b5cf6, #7c3aed)',
+    'linear-gradient(135deg, #ec4899, #db2777)',
+    'linear-gradient(135deg, #f59e0b, #d97706)',
+    'linear-gradient(135deg, #3b82f6, #2563eb)'
+  ];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  const index = Math.abs(hash) % gradients.length;
+  return { background: gradients[index], color: '#fff' };
+};
 
 export default {
   setup(v: any) {
@@ -11,6 +26,7 @@ export default {
     v.registerPage('/', MailWorkspace);
   }
 };
+
 
 function MailWorkspace() {
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
@@ -29,6 +45,13 @@ function MailWorkspace() {
   const [showAccountDropdown, setShowAccountDropdown] = useState<boolean>(false);
   const [showComposeFabMenu, setShowComposeFabMenu] = useState<boolean>(false);
 
+  // In-line Reply / Forward state (Gmail style)
+  const [inlineAction, setInlineAction] = useState<'reply' | 'forward' | null>(null);
+  const [inlineTo, setInlineTo] = useState<string>('');
+  const [inlineSubject, setInlineSubject] = useState<string>('');
+  const [inlineBody, setInlineBody] = useState<string>('');
+  const inlineTextareaRef = useRef<HTMLTextAreaElement>(null);
+
   // Account creation modal state
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [newAccType, setNewAccType] = useState<'gmail' | 'imap'>('gmail');
@@ -37,7 +60,7 @@ function MailWorkspace() {
   const [newAccPort, setNewAccPort] = useState<number>(993);
   const [newAccPassword, setNewAccPassword] = useState<string>('');
 
-  // Compose / Reply / Forward email modal state
+  // Compose modal state (strictly for brand new emails)
   const [showComposeModal, setShowComposeModal] = useState<boolean>(false);
   const [composeTo, setComposeTo] = useState<string>('');
   const [composeSubject, setComposeSubject] = useState<string>('');
@@ -115,6 +138,7 @@ function MailWorkspace() {
   const handleSelectMessage = async (msg: MailMessage) => {
     setSelectedMsg(msg);
     setMsgBody('');
+    setInlineAction(null); // Reset inline action
     setLoadingBody(true);
 
     if (!msg.is_read) {
@@ -210,7 +234,7 @@ function MailWorkspace() {
     }
   };
 
-  // 6. Send Composed / Replied / Forwarded Email
+  // 6. Send outgoing new thread email
   const handleSendMail = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!composeTo || !composeBody || !selectedAccountId) return;
@@ -240,7 +264,42 @@ function MailWorkspace() {
     }
   };
 
-  // 7. Toggle Star Status
+  // 7. Send in-line reply or forward email (Gmail style)
+  const handleSendInlineMail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedAccountId || !selectedMsg) return;
+
+    const recipient = inlineAction === 'reply' ? selectedMsg.sender : inlineTo;
+    if (!recipient) {
+      alert('Please specify a recipient');
+      return;
+    }
+
+    setIsSending(true);
+    try {
+      const res = await vencore.invoke('/send-mail', {
+        accountId: selectedAccountId,
+        to: recipient,
+        subject: inlineSubject || '(No Subject)',
+        body: inlineBody
+      });
+
+      if (res && res.success) {
+        setInlineAction(null);
+        setInlineBody('');
+        setInlineTo('');
+        await loadFolders(selectedAccountId);
+      } else {
+        alert(`Failed to send: ${res?.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      alert(`Error sending email: ${String(err)}`);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // 8. Toggle Star Status
   const handleToggleStar = async (msg: MailMessage, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     try {
@@ -275,7 +334,7 @@ function MailWorkspace() {
     }
   };
 
-  // 8. Delete / Move to Trash
+  // 9. Delete / Move to Trash
   const handleDeleteMessage = async (msg: MailMessage, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     try {
@@ -296,22 +355,32 @@ function MailWorkspace() {
     }
   };
 
-  // 9. Open Reply Modal
-  const handleReply = () => {
+  // 10. In-line action triggers (focuses and pre-fills editor directly under iframe)
+  const triggerInlineAction = (action: 'reply' | 'forward') => {
     if (!selectedMsg) return;
-    setComposeTo(selectedMsg.sender);
-    setComposeSubject(selectedMsg.subject.startsWith('Re:') ? selectedMsg.subject : `Re: ${selectedMsg.subject}`);
-    setComposeBody(`\n\n--- On ${new Date(selectedMsg.date).toLocaleString()}, ${selectedMsg.sender} wrote:\n> ${selectedMsg.snippet}`);
-    setShowComposeModal(true);
-  };
 
-  // 10. Open Forward Modal
-  const handleForward = () => {
-    if (!selectedMsg) return;
-    setComposeTo('');
-    setComposeSubject(selectedMsg.subject.startsWith('Fwd:') ? selectedMsg.subject : `Fwd: ${selectedMsg.subject}`);
-    setComposeBody(`\n\n---------- Forwarded message ---------\nFrom: ${selectedMsg.sender}\nDate: ${new Date(selectedMsg.date).toLocaleString()}\nSubject: ${selectedMsg.subject}\nTo: ${selectedMsg.recipient}\n\n${selectedMsg.snippet}`);
-    setShowComposeModal(true);
+    setInlineAction(action);
+    setInlineTo(action === 'reply' ? selectedMsg.sender : '');
+    
+    const subjectPrefix = action === 'reply' ? 'Re: ' : 'Fwd: ';
+    const cleanPrefix = action === 'reply' ? 'Re:' : 'Fwd:';
+    setInlineSubject(selectedMsg.subject.startsWith(cleanPrefix) ? selectedMsg.subject : subjectPrefix + selectedMsg.subject);
+
+    const timeStr = new Date(selectedMsg.date).toLocaleString();
+    if (action === 'reply') {
+      setInlineBody(`\n\n--- On ${timeStr}, ${selectedMsg.sender} wrote:\n> ${selectedMsg.snippet}`);
+    } else {
+      setInlineBody(`\n\n---------- Forwarded message ---------\nFrom: ${selectedMsg.sender}\nDate: ${timeStr}\nSubject: ${selectedMsg.subject}\nTo: ${selectedMsg.recipient}\n\n${selectedMsg.snippet}`);
+    }
+
+    // Delay focus slightly so component is mounted
+    setTimeout(() => {
+      if (inlineTextareaRef.current) {
+        inlineTextareaRef.current.focus();
+        inlineTextareaRef.current.setSelectionRange(0, 0); // Put cursor at top
+        inlineTextareaRef.current.scrollIntoView({ behavior: 'smooth' });
+      }
+    }, 100);
   };
 
   // Helper to parse flags securely
@@ -338,22 +407,6 @@ function MailWorkspace() {
       const timeB = new Date(b.date).getTime();
       return sortOrder === 'desc' ? timeB - timeA : timeA - timeB;
     });
-
-  // Calculate sender initial & gradient for avatar badges
-  const getAvatarStyle = (name: string) => {
-    const gradients = [
-      'linear-gradient(135deg, #10b981, #059669)',
-      'linear-gradient(135deg, #6366f1, #4f46e5)',
-      'linear-gradient(135deg, #8b5cf6, #7c3aed)',
-      'linear-gradient(135deg, #ec4899, #db2777)',
-      'linear-gradient(135deg, #f59e0b, #d97706)',
-      'linear-gradient(135deg, #3b82f6, #2563eb)'
-    ];
-    let hash = 0;
-    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-    const index = Math.abs(hash) % gradients.length;
-    return { background: gradients[index], color: '#fff' };
-  };
 
   const activeAccount = accounts.find(a => a.id === selectedAccountId);
   const activeInitial = activeAccount ? activeAccount.email[0].toUpperCase() : 'M';
@@ -524,12 +577,13 @@ function MailWorkspace() {
       <section style={readerCol}>
         {selectedMsg ? (
           <div style={readerContent}>
+            {/* Header Meta Pane */}
             <div style={readerHeader}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
                 <h2 style={readerSubject}>{selectedMsg.subject}</h2>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <button onClick={handleReply} style={readerActionBtn}>Reply</button>
-                  <button onClick={handleForward} style={readerActionBtn}>Forward</button>
+                  <button onClick={() => triggerInlineAction('reply')} style={readerActionBtn}>Reply</button>
+                  <button onClick={() => triggerInlineAction('forward')} style={readerActionBtn}>Forward</button>
                   <button
                     onClick={e => handleToggleStar(selectedMsg, e)}
                     style={readerActionBtn}
@@ -551,6 +605,7 @@ function MailWorkspace() {
               </div>
             </div>
 
+            {/* Email Iframe Viewport Container */}
             <div style={readerBodyContainer}>
               {loadingBody ? (
                 <div style={bodyLoader}>Loading message content...</div>
@@ -563,6 +618,59 @@ function MailWorkspace() {
                 />
               )}
             </div>
+
+            {/* Gmail-style Inline Composer Footer */}
+            {inlineAction === null ? (
+              <div style={inlinePlaceholderContainer}>
+                <button onClick={() => triggerInlineAction('reply')} style={inlinePlaceholderBtn}>
+                  Reply to {selectedMsg.sender.split(' <')[0]}...
+                </button>
+                <button onClick={() => triggerInlineAction('forward')} style={inlinePlaceholderBtn}>
+                  Forward this message...
+                </button>
+              </div>
+            ) : (
+              <div style={inlineComposerCard}>
+                <div style={inlineComposerHeader}>
+                  <span style={inlineComposerActionName}>
+                    {inlineAction === 'reply' ? `Replying to ${selectedMsg.sender}` : 'Forwarding Message'}
+                  </span>
+                  <button onClick={() => setInlineAction(null)} style={inlineComposerCloseBtn} title="Close inline editor">✕</button>
+                </div>
+                <form onSubmit={handleSendInlineMail} style={inlineComposerForm}>
+                  {inlineAction === 'forward' && (
+                    <div style={inlineComposerField}>
+                      <label style={inlineFieldLabel}>To:</label>
+                      <input
+                        type="email"
+                        required
+                        placeholder="recipient@example.com"
+                        value={inlineTo}
+                        onChange={e => setInlineTo(e.target.value)}
+                        style={inlineFieldInput}
+                      />
+                    </div>
+                  )}
+                  <textarea
+                    ref={inlineTextareaRef}
+                    required
+                    rows={6}
+                    placeholder={inlineAction === 'reply' ? "Write your reply here..." : "Write your forwarded message here..."}
+                    value={inlineBody}
+                    onChange={e => setInlineBody(e.target.value)}
+                    style={inlineComposerTextarea}
+                  />
+                  <div style={inlineComposerActions}>
+                    <button type="submit" disabled={isSending} style={inlineSendBtn}>
+                      {isSending ? 'Sending...' : 'Send'}
+                    </button>
+                    <button type="button" onClick={() => setInlineAction(null)} style={inlineDiscardBtn}>
+                      Discard
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
           </div>
         ) : (
           <div style={emptyState}>Select an email to view its content.</div>
@@ -687,7 +795,7 @@ function MailWorkspace() {
         </div>
       )}
 
-      {/* Compose Modal */}
+      {/* Compose Modal (for brand new outgoing mail threads) */}
       {showComposeModal && (
         <div style={modalBackdrop}>
           <div style={{ ...modalCard, width: 520 }}>
@@ -770,16 +878,33 @@ const messageSnippet: React.CSSProperties = { fontSize: 12, color: 'var(--text2)
 
 const readerCol: React.CSSProperties = { flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', position: 'relative' };
 const readerContent: React.CSSProperties = { display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--surface)' };
-const readerHeader: React.CSSProperties = { padding: '24px 32px', borderBottom: '1px solid var(--border)' };
+const readerHeader: React.CSSProperties = { padding: '24px 32px', borderBottom: '1px solid var(--border)', flexShrink: 0 };
 const readerSubject: React.CSSProperties = { margin: 0, fontSize: 20, fontWeight: 700, color: 'var(--text)', fontFamily: 'Instrument Serif, serif' };
 const readerActionBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--text)' };
 const readerDeleteBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 6, background: 'rgba(239,68,68,0.08)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: '#ef4444' };
 const readerMeta: React.CSSProperties = { fontSize: 13, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 4 };
 const readerDate: React.CSSProperties = { fontSize: 12, color: 'var(--text3)', marginTop: 2 };
-const readerBodyContainer: React.CSSProperties = { flex: 1, padding: '24px 32px', background: 'var(--bg)', display: 'flex' };
+const readerBodyContainer: React.CSSProperties = { flex: 1, padding: '24px 32px', background: 'var(--bg)', display: 'flex', minHeight: 250 };
 const readerIframe: React.CSSProperties = { width: '100%', height: '100%', border: '1px solid var(--border)', background: '#ffffff', color: '#111111', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.03)' };
 const bodyLoader: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%', color: 'var(--text3)', fontSize: 14 };
 const emptyState: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text3)', fontSize: 14 };
+
+/* Gmail-style Inline Composer Footer Styles */
+const inlinePlaceholderContainer: React.CSSProperties = { padding: '16px 32px', borderTop: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', gap: 12, flexShrink: 0 };
+const inlinePlaceholderBtn: React.CSSProperties = { flex: 1, padding: '10px 16px', border: '1px solid var(--border)', borderRadius: 20, background: 'var(--bg)', color: 'var(--text3)', textAlign: 'left', cursor: 'pointer', fontSize: 13, transition: 'all 0.15s ease' };
+
+const inlineComposerCard: React.CSSProperties = { padding: '16px 32px', borderTop: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 12, flexShrink: 0 };
+const inlineComposerHeader: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center' };
+const inlineComposerActionName: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: 'var(--text2)' };
+const inlineComposerCloseBtn: React.CSSProperties = { background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer', fontSize: 14, padding: 0 };
+const inlineComposerForm: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 10 };
+const inlineComposerField: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--border)', paddingBottom: 6 };
+const inlineFieldLabel: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: 'var(--text2)', width: 32 };
+const inlineFieldInput: React.CSSProperties = { flex: 1, border: 'none', background: 'transparent', color: 'var(--text)', fontSize: 13, outline: 'none' };
+const inlineComposerTextarea: React.CSSProperties = { width: '100%', border: 'none', background: 'transparent', color: 'var(--text)', fontSize: 13, resize: 'vertical', outline: 'none', fontFamily: 'inherit', minHeight: 120 };
+const inlineComposerActions: React.CSSProperties = { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4 };
+const inlineSendBtn: React.CSSProperties = { padding: '6px 16px', borderRadius: 20, border: 'none', background: 'var(--text)', color: 'var(--bg)', fontWeight: 600, fontSize: 13, cursor: 'pointer' };
+const inlineDiscardBtn: React.CSSProperties = { padding: '6px 16px', borderRadius: 20, border: 'none', background: 'transparent', color: 'var(--text3)', fontSize: 13, cursor: 'pointer' };
 
 /* Floating Action Button (FAB) Styles */
 const fabContainer: React.CSSProperties = { position: 'absolute', bottom: 32, right: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, zIndex: 90 };

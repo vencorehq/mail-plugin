@@ -89,12 +89,9 @@ export default {
 
         const externalId = `sent_${Date.now()}_${accountId}`;
 
-        // Save full body in key-value plugin storage (JSON stringified to satisfy jsonb value column constraint)
+        // Save full body in key-value plugin storage (without redundant To/From header tags to prevent duplication)
         await vencore.storage.set(`body:${externalId}`, JSON.stringify(`
-          <div style="font-family: sans-serif; padding: 20px; line-height: 1.6;">
-            <p style="margin:0 0 4px;"><strong>To:</strong> ${to}</p>
-            <p style="margin:0 0 16px;"><strong>From:</strong> ${account.email}</p>
-            <hr style="border: 0; border-top: 1px solid #eee; margin: 16px 0;" />
+          <div style="font-family: sans-serif; padding: 20px; line-height: 1.6; color: #111111; background: #ffffff;">
             <div style="white-space: pre-wrap;">${body}</div>
           </div>
         `));
