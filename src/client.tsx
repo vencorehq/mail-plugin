@@ -16,14 +16,19 @@ function MailWorkspace() {
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
   const [folders, setFolders] = useState<MailFolder[]>([]);
-  const [selectedFolderId, setSelectedFolderId] = useState<string>('all'); // 'all', 'starred', or folder.id
+  const [selectedFolderType, setSelectedFolderType] = useState<string>('inbox'); // 'inbox', 'starred', 'sent', 'spam', 'trash'
   const [messages, setMessages] = useState<MailMessage[]>([]);
   const [selectedMsg, setSelectedMsg] = useState<MailMessage | null>(null);
   const [msgBody, setMsgBody] = useState<string>('');
   const [loadingBody, setLoadingBody] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   
+  // Account dropdown & Compose FAB sub-menus
+  const [showAccountDropdown, setShowAccountDropdown] = useState<boolean>(false);
+  const [showComposeFabMenu, setShowComposeFabMenu] = useState<boolean>(false);
+
   // Account creation modal state
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [newAccType, setNewAccType] = useState<'gmail' | 'imap'>('gmail');
@@ -61,50 +66,50 @@ function MailWorkspace() {
     try {
       const data = (await vencore.table('mail_folders').list({ where: { account_id: accountId } })) as MailFolder[];
       setFolders(data);
-      if (data.length > 0) {
-        if (selectedFolderId === 'all') {
-          loadMessages(data[0].id);
-          setSelectedFolderId(data[0].id);
-        } else if (selectedFolderId !== 'starred') {
-          loadMessages(selectedFolderId);
-        } else {
-          loadStarredMessages(accountId);
-        }
-      } else {
-        setFolders([]);
-        setMessages([]);
-      }
+      loadMessagesForFolderType(accountId, selectedFolderType, data);
     } catch (err) {
       console.error('Failed to load folders:', err);
     }
   };
 
-  const loadMessages = async (folderId: string) => {
-    try {
-      const data = (await vencore.table('mail_messages').list({ where: { folder_id: folderId } })) as MailMessage[];
-      const sorted = data.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      setMessages(sorted);
-    } catch (err) {
-      console.error('Failed to load messages:', err);
+  const loadMessagesForFolderType = async (accountId: string, type: string, activeFolders = folders) => {
+    if (!accountId) return;
+
+    if (type === 'starred') {
+      try {
+        const data = (await vencore.table('mail_messages').list({ where: { account_id: accountId } })) as MailMessage[];
+        const starred = data.filter(m => {
+          const flags = m.flags;
+          const currentFlags: string[] = typeof flags === 'string'
+            ? JSON.parse(flags)
+            : Array.isArray(flags) ? flags : [];
+          return currentFlags.includes('STARRED');
+        });
+        setMessages(starred);
+      } catch (err) {
+        console.error('Failed to load starred messages:', err);
+      }
+      return;
+    }
+
+    const folder = activeFolders.find(f => f.type === type);
+    if (folder) {
+      try {
+        const data = (await vencore.table('mail_messages').list({ where: { folder_id: folder.id } })) as MailMessage[];
+        setMessages(data);
+      } catch (err) {
+        console.error('Failed to load messages:', err);
+      }
+    } else {
+      setMessages([]);
     }
   };
 
-  const loadStarredMessages = async (accountId: string) => {
-    try {
-      const data = (await vencore.table('mail_messages').list({ where: { account_id: accountId } })) as MailMessage[];
-      const starred = data.filter(m => {
-        const flags = m.flags;
-        const currentFlags: string[] = typeof flags === 'string'
-          ? JSON.parse(flags)
-          : Array.isArray(flags) ? flags : [];
-        return currentFlags.includes('STARRED');
-      });
-      const sorted = starred.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      setMessages(sorted);
-    } catch (err) {
-      console.error('Failed to load starred messages:', err);
+  useEffect(() => {
+    if (selectedAccountId) {
+      loadMessagesForFolderType(selectedAccountId, selectedFolderType);
     }
-  };
+  }, [selectedFolderType]);
 
   // 2. Select Message and Fetch Body Dynamically
   const handleSelectMessage = async (msg: MailMessage) => {
@@ -250,7 +255,7 @@ function MailWorkspace() {
             const updatedFlags = nextStarred
               ? [...currentFlags, 'STARRED']
               : currentFlags.filter(f => f !== 'STARRED');
-            return { ...m, flags: updatedFlags }; // Saved locally as array to match typescript type
+            return { ...m, flags: updatedFlags };
           }
           return m;
         }));
@@ -318,15 +323,21 @@ function MailWorkspace() {
     return currentFlags.includes('STARRED');
   };
 
-  // Filter messages based on search query
-  const filteredMessages = messages.filter(msg => {
-    const query = searchQuery.toLowerCase();
-    return (
-      msg.subject.toLowerCase().includes(query) ||
-      msg.sender.toLowerCase().includes(query) ||
-      msg.snippet.toLowerCase().includes(query)
-    );
-  });
+  // Filter & Sort messages
+  const processedMessages = messages
+    .filter(msg => {
+      const query = searchQuery.toLowerCase();
+      return (
+        msg.subject.toLowerCase().includes(query) ||
+        msg.sender.toLowerCase().includes(query) ||
+        msg.snippet.toLowerCase().includes(query)
+      );
+    })
+    .sort((a, b) => {
+      const timeA = new Date(a.date).getTime();
+      const timeB = new Date(b.date).getTime();
+      return sortOrder === 'desc' ? timeB - timeA : timeA - timeB;
+    });
 
   // Calculate sender initial & gradient for avatar badges
   const getAvatarStyle = (name: string) => {
@@ -344,97 +355,75 @@ function MailWorkspace() {
     return { background: gradients[index], color: '#fff' };
   };
 
+  const activeAccount = accounts.find(a => a.id === selectedAccountId);
+  const activeInitial = activeAccount ? activeAccount.email[0].toUpperCase() : 'M';
+
   return (
     <div style={container}>
-      {/* Sidebar - Accounts & Folders */}
-      <aside style={sidebar}>
-        <div style={sidebarHeader}>
-          <select 
-            value={selectedAccountId} 
-            onChange={e => {
-              setSelectedAccountId(e.target.value);
-              loadFolders(e.target.value);
-              setSelectedMsg(null);
-            }} 
-            style={accountSelector}
-          >
-            {accounts.map(acc => (
-              <option key={acc.id} value={acc.id}>{acc.email} ({acc.type})</option>
-            ))}
-            {accounts.length === 0 && <option value="">No Accounts Linked</option>}
-          </select>
-          <button onClick={() => setShowAddModal(true)} style={addButton} title="Connect new account">+</button>
-          {selectedAccountId && (
-            <button onClick={handleDeleteAccount} style={deleteAccBtn} title="Disconnect selected account">✕</button>
-          )}
-        </div>
-
-        {/* Compose Button */}
-        <button 
-          onClick={() => {
-            if (!selectedAccountId) {
-              alert('Please connect and select an account first!');
-              return;
-            }
-            setComposeTo('');
-            setComposeSubject('');
-            setComposeBody('');
-            setShowComposeModal(true);
-          }} 
-          style={composeBtn}
-        >
-          Compose Mail
-        </button>
-
-        {/* Folders & Starred Navigation */}
-        <div style={foldersList}>
-          <button
-            onClick={() => {
-              setSelectedFolderId('starred');
-              if (selectedAccountId) loadStarredMessages(selectedAccountId);
-              setSelectedMsg(null);
-            }}
-            style={{
-              ...folderTab,
-              background: selectedFolderId === 'starred' ? 'var(--surface2)' : 'transparent',
-              fontWeight: selectedFolderId === 'starred' ? 600 : 400
-            }}
-          >
-            <span>Starred</span>
-          </button>
-
-          <hr style={{ border: 0, borderTop: '1px solid var(--border)', margin: '6px 0' }} />
-
-          {folders.map(folder => (
-            <button
-              key={folder.id}
-              onClick={() => {
-                setSelectedFolderId(folder.id);
-                loadMessages(folder.id);
-                setSelectedMsg(null);
-              }}
-              style={{
-                ...folderTab,
-                background: selectedFolderId === folder.id ? 'var(--surface2)' : 'transparent',
-                fontWeight: selectedFolderId === folder.id ? 600 : 400
-              }}
-            >
-              <span>{folder.name}</span>
-              {folder.unread_count > 0 && (
-                <span style={unreadBadge}>{folder.unread_count}</span>
-              )}
-            </button>
-          ))}
-        </div>
-
-        <button onClick={handleSyncNow} disabled={isSyncing} style={syncButton}>
-          {isSyncing ? 'Syncing...' : 'Sync Inbox Now'}
-        </button>
-      </aside>
-
       {/* Messages List Column */}
       <section style={messagesCol}>
+        {/* Row 1: Workspace Header & Account Profile Icon */}
+        <div style={headerRow}>
+          <h1 style={workspaceTitle}>Mail Workspace</h1>
+          <div style={{ position: 'relative' }}>
+            <button 
+              onClick={() => setShowAccountDropdown(!showAccountDropdown)} 
+              style={{ ...profileBtn, ...getAvatarStyle(activeAccount?.email || 'Vencore') }}
+              title="Account Settings"
+            >
+              {activeInitial}
+            </button>
+            {showAccountDropdown && (
+              <div style={accountMenu}>
+                <div style={menuHeader}>Connected Accounts</div>
+                {accounts.map(acc => (
+                  <button
+                    key={acc.id}
+                    onClick={() => {
+                      setSelectedAccountId(acc.id);
+                      loadFolders(acc.id);
+                      setSelectedMsg(null);
+                      setShowAccountDropdown(false);
+                    }}
+                    style={{
+                      ...menuItem,
+                      fontWeight: selectedAccountId === acc.id ? 600 : 400,
+                      background: selectedAccountId === acc.id ? 'var(--surface2)' : 'transparent'
+                    }}
+                  >
+                    <span>{acc.email}</span>
+                    {selectedAccountId === acc.id && <span style={{ color: 'var(--blue)' }}>✓</span>}
+                  </button>
+                ))}
+                <hr style={menuDivider} />
+                <button onClick={() => { setShowAddModal(true); setShowAccountDropdown(false); }} style={menuActionBtn}>
+                  + Connect Account
+                </button>
+                {selectedAccountId && (
+                  <button onClick={() => { handleDeleteAccount(); setShowAccountDropdown(false); }} style={{ ...menuActionBtn, color: '#ef4444' }}>
+                    ✕ Disconnect Account
+                  </button>
+                )}
+                <hr style={menuDivider} />
+                <button onClick={() => alert('Log out simulated.')} style={{ ...menuActionBtn, color: 'var(--text3)' }}>
+                  Log Out
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2: Search bar with inline Left/Right buttons */}
         <div style={searchBarContainer}>
+          {/* Left Buttons: Filter & Refresh */}
+          <button onClick={() => alert('Filter clicked')} style={iconBtn} title="Filter messages">
+            <svg style={svgIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon></svg>
+          </button>
+          <button onClick={handleSyncNow} disabled={isSyncing} style={iconBtn} title="Refresh Sync">
+            <svg style={{ ...svgIcon, animation: isSyncing ? 'spin 1s linear infinite' : 'none' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+          </button>
+
+          {/* Search Input */}
           <input
             type="text"
             placeholder="Search mail..."
@@ -442,10 +431,47 @@ function MailWorkspace() {
             onChange={e => setSearchQuery(e.target.value)}
             style={searchInput}
           />
+
+          {/* Right Buttons: Search Trigger & Date Sort Toggle */}
+          <button onClick={() => alert('Searching...')} style={iconBtn} title="Search">
+            <svg style={svgIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+          </button>
+          <button 
+            onClick={() => setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc')} 
+            style={iconBtn} 
+            title={`Sort: ${sortOrder === 'desc' ? 'Newest first' : 'Oldest first'}`}
+          >
+            <svg style={svgIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
+          </button>
         </div>
 
+        {/* Row 3: Navigation Tags/Pills */}
+        <div style={pillsContainer}>
+          {[
+            { label: 'Inbox', type: 'inbox' },
+            { label: 'Starred', type: 'starred' },
+            { label: 'Sent', type: 'sent' },
+            { label: 'Junk', type: 'spam' },
+            { label: 'Trash', type: 'trash' }
+          ].map(tag => (
+            <button
+              key={tag.type}
+              onClick={() => setSelectedFolderType(tag.type)}
+              style={{
+                ...pillTag,
+                background: selectedFolderType === tag.type ? 'var(--text)' : 'var(--surface2)',
+                color: selectedFolderType === tag.type ? 'var(--bg)' : 'var(--text)',
+                fontWeight: selectedFolderType === tag.type ? 600 : 400
+              }}
+            >
+              {tag.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Row 4: Message Card List */}
         <div style={messagesList}>
-          {filteredMessages.map(msg => {
+          {processedMessages.map(msg => {
             const isStarred = isMessageStarred(msg);
             const senderName = msg.sender.split(' <')[0].replace(/"/g, '');
             const initial = (senderName[0] || 'M').toUpperCase();
@@ -488,7 +514,7 @@ function MailWorkspace() {
             );
           })}
 
-          {filteredMessages.length === 0 && (
+          {processedMessages.length === 0 && (
             <div style={emptyState}>No messages in this folder.</div>
           )}
         </div>
@@ -541,6 +567,61 @@ function MailWorkspace() {
         ) : (
           <div style={emptyState}>Select an email to view its content.</div>
         )}
+
+        {/* Floating Action Button (FAB) for Compose Mail & Draft options */}
+        <div style={fabContainer}>
+          {showComposeFabMenu && (
+            <div style={fabSubmenu}>
+              {/* Option 1: Draft */}
+              <div style={fabOptionWrapper}>
+                <span style={fabLabel}>Draft</span>
+                <button 
+                  onClick={() => {
+                    if (!selectedAccountId) return alert('Please connect an account first!');
+                    setComposeTo('');
+                    setComposeSubject('[Draft]');
+                    setComposeBody('');
+                    setShowComposeModal(true);
+                    setShowComposeFabMenu(false);
+                  }} 
+                  style={fabOptionCircle}
+                >
+                  ✎
+                </button>
+              </div>
+
+              {/* Option 2: Mail */}
+              <div style={fabOptionWrapper}>
+                <span style={fabLabel}>Mail</span>
+                <button 
+                  onClick={() => {
+                    if (!selectedAccountId) return alert('Please connect an account first!');
+                    setComposeTo('');
+                    setComposeSubject('');
+                    setComposeBody('');
+                    setShowComposeModal(true);
+                    setShowComposeFabMenu(false);
+                  }} 
+                  style={fabOptionCircle}
+                >
+                  ✉
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Master FAB Trigger Button */}
+          <button 
+            onClick={() => setShowComposeFabMenu(!showComposeFabMenu)} 
+            style={{ 
+              ...fabTriggerCircle, 
+              transform: showComposeFabMenu ? 'rotate(45deg)' : 'rotate(0deg)' 
+            }}
+            title="Compose options"
+          >
+            +
+          </button>
+        </div>
       </section>
 
       {/* Connect Account Modal */}
@@ -606,7 +687,7 @@ function MailWorkspace() {
         </div>
       )}
 
-      {/* Compose / Reply / Forward Modal */}
+      {/* Compose Modal */}
       {showComposeModal && (
         <div style={modalBackdrop}>
           <div style={{ ...modalCard, width: 520 }}>
@@ -657,20 +738,26 @@ function MailWorkspace() {
 
 // Styling Constants
 const container: React.CSSProperties = { display: 'flex', height: '100vh', background: 'var(--bg)', fontFamily: 'DM Sans, sans-serif', overflow: 'hidden' };
-const sidebar: React.CSSProperties = { width: 230, borderRight: '1px solid var(--border)', background: 'var(--surface)', display: 'flex', flexDirection: 'column', padding: 16, flexShrink: 0 };
-const sidebarHeader: React.CSSProperties = { display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' };
-const accountSelector: React.CSSProperties = { flex: 1, padding: '6px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', fontSize: 12, color: 'var(--text)' };
-const addButton: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', fontSize: 14, fontWeight: 700 };
-const deleteAccBtn: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'rgba(239,68,68,0.1)', color: '#ef4444', cursor: 'pointer', fontSize: 12, fontWeight: 700 };
-const composeBtn: React.CSSProperties = { width: '100%', padding: '9px 0', borderRadius: 6, border: 'none', background: 'var(--text)', color: 'var(--bg)', fontSize: 13, fontWeight: 600, cursor: 'pointer', marginBottom: 16, textAlign: 'center' };
-const foldersList: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, flex: 1 };
-const folderTab: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', textAlign: 'left', fontSize: 13, color: 'var(--text)' };
-const unreadBadge: React.CSSProperties = { background: 'var(--blue)', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 999 };
-const syncButton: React.CSSProperties = { marginTop: 'auto', padding: '10px 0', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface2)', cursor: 'pointer', fontSize: 13, fontWeight: 600, color: 'var(--text)' };
 
-const messagesCol: React.CSSProperties = { width: 340, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', flexShrink: 0 };
-const searchBarContainer: React.CSSProperties = { padding: 16, borderBottom: '1px solid var(--border)', background: 'var(--surface)' };
-const searchInput: React.CSSProperties = { width: '100%', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
+const messagesCol: React.CSSProperties = { width: 360, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', flexShrink: 0, background: 'var(--surface)' };
+const headerRow: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 20px', borderBottom: '1px solid var(--border)' };
+const workspaceTitle: React.CSSProperties = { margin: 0, fontSize: 18, fontWeight: 700, color: 'var(--text)', fontFamily: 'Instrument Serif, serif' };
+const profileBtn: React.CSSProperties = { width: 32, height: 32, borderRadius: 999, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 700, border: 'none', cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,0.06)' };
+
+const accountMenu: React.CSSProperties = { position: 'absolute', right: 0, top: '40px', width: 220, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 12, boxShadow: '0 8px 30px rgba(0,0,0,0.15)', zIndex: 110 };
+const menuHeader: React.CSSProperties = { fontSize: 11, fontWeight: 600, color: 'var(--text3)', textTransform: 'uppercase', marginBottom: 8, paddingLeft: 8 };
+const menuItem: React.CSSProperties = { width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 12, color: 'var(--text)', textAlign: 'left', transition: 'background 0.15s' };
+const menuDivider: React.CSSProperties = { border: 0, borderTop: '1px solid var(--border)', margin: '8px 0' };
+const menuActionBtn: React.CSSProperties = { width: '100%', display: 'block', padding: '8px 10px', border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--text)', textAlign: 'left' };
+
+const searchBarContainer: React.CSSProperties = { display: 'flex', gap: 6, padding: '12px 16px', borderBottom: '1px solid var(--border)', alignItems: 'center' };
+const searchInput: React.CSSProperties = { flex: 1, padding: '6px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', fontSize: 13, color: 'var(--text)' };
+const iconBtn: React.CSSProperties = { width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', padding: 0 };
+const svgIcon: React.CSSProperties = { width: 14, height: 14 };
+
+const pillsContainer: React.CSSProperties = { display: 'flex', gap: 6, padding: '10px 16px', overflowX: 'auto', borderBottom: '1px solid var(--border)', scrollbarWidth: 'none' };
+const pillTag: React.CSSProperties = { padding: '5px 12px', borderRadius: 20, border: 'none', fontSize: 12, cursor: 'pointer', flexShrink: 0, transition: 'all 0.15s ease' };
+
 const messagesList: React.CSSProperties = { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' };
 const messageCard: React.CSSProperties = { padding: '14px 16px', borderBottom: '1px solid var(--border)', cursor: 'pointer', transition: 'background 0.15s ease' };
 const messageHeader: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', marginBottom: 6, alignItems: 'center' };
@@ -681,8 +768,8 @@ const messageDate: React.CSSProperties = { fontSize: 11, color: 'var(--text3)' }
 const messageSubject: React.CSSProperties = { fontSize: 13, color: 'var(--text)', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
 const messageSnippet: React.CSSProperties = { fontSize: 12, color: 'var(--text2)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' };
 
-const readerCol: React.CSSProperties = { flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--surface)' };
-const readerContent: React.CSSProperties = { display: 'flex', flexDirection: 'column', height: '100%' };
+const readerCol: React.CSSProperties = { flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', position: 'relative' };
+const readerContent: React.CSSProperties = { display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--surface)' };
 const readerHeader: React.CSSProperties = { padding: '24px 32px', borderBottom: '1px solid var(--border)' };
 const readerSubject: React.CSSProperties = { margin: 0, fontSize: 20, fontWeight: 700, color: 'var(--text)', fontFamily: 'Instrument Serif, serif' };
 const readerActionBtn: React.CSSProperties = { padding: '6px 12px', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg)', cursor: 'pointer', fontSize: 12, fontWeight: 500, color: 'var(--text)' };
@@ -694,7 +781,15 @@ const readerIframe: React.CSSProperties = { width: '100%', height: '100%', borde
 const bodyLoader: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%', color: 'var(--text3)', fontSize: 14 };
 const emptyState: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text3)', fontSize: 14 };
 
-const modalBackdrop: React.CSSProperties = { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 };
+/* Floating Action Button (FAB) Styles */
+const fabContainer: React.CSSProperties = { position: 'absolute', bottom: 32, right: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, zIndex: 90 };
+const fabTriggerCircle: React.CSSProperties = { width: 56, height: 56, borderRadius: 999, border: 'none', background: 'var(--text)', color: 'var(--bg)', fontSize: 24, fontWeight: 300, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 16px rgba(0,0,0,0.18)', transition: 'all 0.2s ease-in-out' };
+const fabSubmenu: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'flex-end' };
+const fabOptionWrapper: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8 };
+const fabLabel: React.CSSProperties = { fontSize: 11, fontWeight: 600, color: 'var(--text2)', background: 'var(--surface)', padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' };
+const fabOptionCircle: React.CSSProperties = { width: 38, height: 38, borderRadius: 999, border: '1px solid var(--border)', background: 'var(--surface)', color: 'var(--text)', fontSize: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.1)' };
+
+const modalBackdrop: React.CSSProperties = { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200 };
 const modalCard: React.CSSProperties = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, width: 400, padding: 24, boxShadow: '0 8px 24px rgba(0,0,0,0.15)' };
 const modalTitle: React.CSSProperties = { margin: '0 0 16px', fontSize: 16, fontWeight: 700, color: 'var(--text)' };
 const modalForm: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 12 };
