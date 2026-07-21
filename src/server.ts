@@ -110,7 +110,7 @@ export default {
           date: new Date().toISOString(),
           snippet: body.slice(0, 100),
           is_read: true,
-          flags: []
+          flags: JSON.stringify([]) // Stringified JSON representation for jsonb column
         });
 
         // Increment total count in Sent folder
@@ -143,14 +143,19 @@ export default {
         const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
         if (!msg) throw new Error('Message not found');
 
-        const currentFlags: string[] = Array.isArray(msg.flags) ? msg.flags : [];
+        // Parse flags properly if stringified in database
+        const rawFlags = msg.flags;
+        const currentFlags: string[] = typeof rawFlags === 'string'
+          ? JSON.parse(rawFlags)
+          : Array.isArray(rawFlags) ? rawFlags : [];
+
         const isStarred = currentFlags.includes('STARRED');
         const nextFlags = isStarred
           ? currentFlags.filter(f => f !== 'STARRED')
           : [...currentFlags, 'STARRED'];
 
         await vencore.table('mail_messages').update(messageId, {
-          flags: nextFlags
+          flags: JSON.stringify(nextFlags) // Stringified JSON representation
         });
 
         return {
@@ -296,7 +301,7 @@ async function syncAccount(vencore: any, account: MailAccount) {
           subject: msg.subject,
           snippet: msg.snippet,
           is_read: msg.is_read,
-          flags: msg.flags
+          flags: JSON.stringify(msg.flags) // Stringified JSON representation
         });
       } else {
         await vencore.table('mail_messages').insert({
@@ -309,7 +314,7 @@ async function syncAccount(vencore: any, account: MailAccount) {
           date: msg.date,
           snippet: msg.snippet,
           is_read: msg.is_read,
-          flags: msg.flags
+          flags: JSON.stringify(msg.flags) // Stringified JSON representation for jsonb column
         });
       }
     }
