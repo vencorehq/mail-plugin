@@ -89,15 +89,15 @@ export default {
 
         const externalId = `sent_${Date.now()}_${accountId}`;
 
-        // Save full body in key-value plugin storage (keeps relational SQL tables lightweight)
-        await vencore.storage.set(`body:${externalId}`, `
+        // Save full body in key-value plugin storage (JSON stringified to satisfy jsonb value column constraint)
+        await vencore.storage.set(`body:${externalId}`, JSON.stringify(`
           <div style="font-family: sans-serif; padding: 20px; line-height: 1.6;">
             <p style="margin:0 0 4px;"><strong>To:</strong> ${to}</p>
             <p style="margin:0 0 16px;"><strong>From:</strong> ${account.email}</p>
             <hr style="border: 0; border-top: 1px solid #eee; margin: 16px 0;" />
             <div style="white-space: pre-wrap;">${body}</div>
           </div>
-        `);
+        `));
 
         // Insert message header into SQL DB
         await vencore.table('mail_messages').insert({
@@ -414,8 +414,15 @@ async function fetchMessageBodyFromSource(vencore: any, accountId: string, messa
   const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
   if (!msg) throw new Error('Message not found');
 
+  // Check if this is a custom sent message stored in the key-value storage
   const storedBody = await vencore.storage.get(`body:${msg.external_id}`);
-  if (storedBody) return storedBody;
+  if (storedBody) {
+    try {
+      return JSON.parse(storedBody);
+    } catch {
+      return storedBody;
+    }
+  }
 
   if (msg.external_id.startsWith('g_msg_1')) {
     return `
