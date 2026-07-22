@@ -1,8 +1,11 @@
+import { ImapFlow } from 'imapflow';
+import nodemailer from 'nodemailer';
+import { simpleParser } from 'mailparser';
 import type { MailAccount, MailFolder, MailMessage } from './types';
 
 export default {
   async setup(vencore: any) {
-    console.log('Initializing Vencore Mail Plugin v2...');
+    console.log('Initializing Vencore Mail Plugin v2 (Real IMAP & SMTP Enabled)...');
 
     // 1. Register cron job for delta mail synchronization (runs every 60 seconds)
     vencore.cron.register('*/1 * * * *', 'sync-mail', async () => {
@@ -13,7 +16,7 @@ export default {
       }
     });
 
-    // 2. Register HTTP endpoint to fetch mail body dynamically
+    // 2. Register HTTP endpoint to fetch mail body dynamically (on-demand IMAP stream)
     vencore.http.onEndpoint('/fetch-body', async (req: any) => {
       try {
         const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -58,7 +61,7 @@ export default {
       }
     });
 
-    // 4. Register HTTP endpoint to send or reply/forward a new email
+    // 4. Register HTTP endpoint to send or reply/forward a new email (SMTP)
     vencore.http.onEndpoint('/send-mail', async (req: any) => {
       try {
         const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -68,7 +71,10 @@ export default {
         const account = (await vencore.table('mail_accounts').get(accountId)) as MailAccount;
         if (!account) throw new Error('Account not found');
 
-        // Find or create the Sent folder for this account
+        // Send real email via SMTP
+        await sendOutgoingEmail(account, to, subject, body);
+
+        // Find or create the Sent folder for this account in local DB
         const folders = (await vencore.table('mail_folders').list({
           where: { account_id: accountId, type: 'sent' }
         })) as MailFolder[];
@@ -89,7 +95,7 @@ export default {
 
         const externalId = `sent_${Date.now()}_${accountId}`;
 
-        // Save full body in key-value plugin storage (without redundant To/From header tags to prevent duplication)
+        // Save full body in key-value plugin storage (JSON stringified to satisfy jsonb value column constraint)
         await vencore.storage.set(`body:${externalId}`, JSON.stringify(`
           <div style="font-family: sans-serif; padding: 20px; line-height: 1.6; color: #111111; background: #ffffff;">
             <div style="white-space: pre-wrap;">${body}</div>
@@ -242,6 +248,61 @@ export default {
   }
 };
 
+// Auto-resolves SMTP hostname from IMAP settings
+function getSmtpConfig(account: MailAccount) {
+  const creds = account.credentials;
+
+  if (account.type === 'gmail') {
+    return {
+      service: 'gmail',
+      auth: {
+        user: account.email,
+        pass: creds.password
+      }
+    };
+  }
+
+  // Swap imap.host to smtp.host
+  const imapHost = creds.host || '';
+  let smtpHost = imapHost;
+  if (imapHost.startsWith('imap.')) {
+    smtpHost = imapHost.replace(/^imap\./, 'smtp.');
+  } else if (imapHost.startsWith('mail.')) {
+    smtpHost = imapHost.replace(/^mail\./, 'smtp.');
+  }
+
+  return {
+    host: smtpHost,
+    port: 465,
+    secure: true,
+    auth: {
+      user: account.email,
+      pass: creds.password
+    },
+    tls: {
+      rejectUnauthorized: false // Resilient against self-signed certificates
+    }
+  };
+}
+
+// Dispatches a real SMTP email
+async function sendOutgoingEmail(account: MailAccount, to: string, subject: string, textBody: string) {
+  const config = getSmtpConfig(account);
+  const transporter = nodemailer.createTransport(config);
+
+  await transporter.sendMail({
+    from: `"${account.email.split('@')[0]}" <${account.email}>`,
+    to,
+    subject,
+    text: textBody,
+    html: `
+      <div style="font-family: sans-serif; line-height: 1.6; color: #111111; background: #ffffff; padding: 20px;">
+        <div style="white-space: pre-wrap;">${textBody}</div>
+      </div>
+    `
+  });
+}
+
 // Synchronize all connected mail accounts
 async function syncAllAccounts(vencore: any) {
   const accounts = (await vencore.table('mail_accounts').list()) as MailAccount[];
@@ -257,161 +318,152 @@ async function syncAllAccounts(vencore: any) {
   }
 }
 
-// Synchronize folders and new messages for a single mail account
+// Synchronize folders and recent messages for a single mail account via real IMAP
 async function syncAccount(vencore: any, account: MailAccount) {
-  // Sync folders list first (Inbox, Sent, Spam, Trash, etc.)
-  const folders = await fetchFoldersFromSource(account);
-  
-  for (const folder of folders) {
-    const existingFolders = await vencore.table('mail_folders').list({
-      where: { account_id: account.id, name: folder.name }
-    });
-    
-    let folderId = '';
-    if (existingFolders.length > 0) {
-      folderId = existingFolders[0].id;
-      await vencore.table('mail_folders').update(folderId, {
-        unread_count: folder.unread_count,
-        total_count: folder.total_count
-      });
-    } else {
-      const created = await vencore.table('mail_folders').insert({
-        account_id: account.id,
-        name: folder.name,
-        type: folder.type,
-        unread_count: folder.unread_count,
-        total_count: folder.total_count
-      });
-      folderId = created.id as string;
+  const creds = account.credentials;
+  const client = new ImapFlow({
+    host: account.type === 'gmail' ? 'imap.gmail.com' : (creds.host || ''),
+    port: account.type === 'gmail' ? 993 : (creds.port || 993),
+    secure: true,
+    auth: {
+      user: account.email,
+      pass: creds.password
+    },
+    logger: false,
+    tls: {
+      rejectUnauthorized: false
     }
-    
-    // Fetch and sync new messages in this folder (delta sync)
-    const messages = await fetchNewMessagesFromSource(account, folder, folderId);
-    for (const msg of messages) {
-      // Manual check-and-upsert to avoid DB index requirement
-      const existing = await vencore.table('mail_messages').list({
-        where: { external_id: msg.external_id }
-      }) as MailMessage[];
+  });
 
-      if (existing.length > 0) {
-        await vencore.table('mail_messages').update(existing[0].id, {
-          subject: msg.subject,
-          snippet: msg.snippet,
-          is_read: msg.is_read,
-          flags: JSON.stringify(msg.flags) // Stringified JSON representation
+  await client.connect();
+
+  try {
+    const folders = await client.list();
+    
+    for (const folder of folders) {
+      // Resolve folder type
+      let folderType = 'custom';
+      const pathUpper = folder.path.toUpperCase();
+      if (pathUpper === 'INBOX' || folder.path === 'INBOX') folderType = 'inbox';
+      else if (pathUpper.includes('SENT')) folderType = 'sent';
+      else if (pathUpper.includes('SPAM') || pathUpper.includes('JUNK')) folderType = 'spam';
+      else if (pathUpper.includes('TRASH') || pathUpper.includes('DELETED')) folderType = 'trash';
+
+      // 1. Fetch total exists & unseen counts
+      let totalCount = 0;
+      let unreadCount = 0;
+
+      const unseenLock = await client.getMailboxLock(folder.path);
+      try {
+        const status = client.mailbox;
+        totalCount = status ? status.exists : 0;
+        const searchResults = await client.search({ seen: false });
+        unreadCount = Array.isArray(searchResults) ? searchResults.length : 0;
+      } catch {
+        // Fallback if mailbox locking failed
+      } finally {
+        unseenLock.release();
+      }
+
+      // Sync folder metadata
+      const existingFolders = await vencore.table('mail_folders').list({
+        where: { account_id: account.id, name: folder.name }
+      });
+      
+      let folderId = '';
+      if (existingFolders.length > 0) {
+        folderId = existingFolders[0].id;
+        await vencore.table('mail_folders').update(folderId, {
+          unread_count: unreadCount,
+          total_count: totalCount
         });
       } else {
-        await vencore.table('mail_messages').insert({
+        const created = await vencore.table('mail_folders').insert({
           account_id: account.id,
-          folder_id: folderId,
-          external_id: msg.external_id,
-          subject: msg.subject,
-          sender: msg.sender,
-          recipient: msg.recipient,
-          date: msg.date,
-          snippet: msg.snippet,
-          is_read: msg.is_read,
-          flags: JSON.stringify(msg.flags) // Stringified JSON representation for jsonb column
+          name: folder.name,
+          type: folderType,
+          unread_count: unreadCount,
+          total_count: totalCount
         });
+        folderId = created.id as string;
+      }
+
+      // 2. Pull recent message headers (fetch last 15 elements to optimize speed)
+      if (totalCount === 0) continue;
+
+      const fetchLock = await client.getMailboxLock(folder.path);
+      try {
+        const startSeq = Math.max(1, totalCount - 14);
+        const endSeq = totalCount;
+        
+        const fetched = client.fetch(`${startSeq}:${endSeq}`, {
+          envelope: true,
+          flags: true
+        });
+
+        for await (const item of fetched) {
+          const envelope = item.envelope;
+          if (!envelope) continue;
+
+          const externalId = item.uid ? String(item.uid) : `msg_${item.seq}`;
+
+          const subject = envelope.subject || '(No Subject)';
+          const sender = envelope.from && envelope.from[0] 
+            ? `"${envelope.from[0].name || ''}" <${envelope.from[0].address}>` 
+            : 'Unknown';
+          const recipient = envelope.to && envelope.to[0] 
+            ? envelope.to[0].address 
+            : account.email;
+          const date = envelope.date ? envelope.date.toISOString() : new Date().toISOString();
+          const isRead = item.flags && item.flags.has('\\Seen');
+          
+          // Flags array
+          const flagsArr: string[] = [];
+          if (item.flags && item.flags.has('\\Flagged')) flagsArr.push('STARRED');
+
+          const existing = await vencore.table('mail_messages').list({
+            where: { account_id: account.id, folder_id: folderId, external_id: externalId }
+          }) as MailMessage[];
+
+          if (existing.length > 0) {
+            await vencore.table('mail_messages').update(existing[0].id, {
+              subject,
+              is_read: isRead,
+              flags: JSON.stringify(flagsArr)
+            });
+          } else {
+            await vencore.table('mail_messages').insert({
+              account_id: account.id,
+              folder_id: folderId,
+              external_id: externalId,
+              subject,
+              sender,
+              recipient,
+              date,
+              snippet: subject.slice(0, 100),
+              is_read: isRead,
+              flags: JSON.stringify(flagsArr)
+            });
+          }
+        }
+      } catch (err) {
+        console.error(`Failed to fetch messages for folder: ${folder.path}`, err);
+      } finally {
+        fetchLock.release();
       }
     }
+  } finally {
+    await client.logout();
   }
 
-  // Notify frontend that sync has completed for this account
   vencore.bus.emit('mail:sync_completed', { accountId: account.id });
 }
 
-// Mock/Fetch helper to simulate Gmail and IMAP fetching folders
-async function fetchFoldersFromSource(account: MailAccount): Promise<Omit<MailFolder, 'id' | 'account_id'>[]> {
-  if (account.type === 'gmail') {
-    return [
-      { name: 'INBOX', type: 'inbox', unread_count: 3, total_count: 10 },
-      { name: 'SENT', type: 'sent', unread_count: 0, total_count: 5 },
-      { name: 'SPAM', type: 'spam', unread_count: 1, total_count: 1 },
-      { name: 'TRASH', type: 'trash', unread_count: 0, total_count: 2 }
-    ];
-  } else {
-    return [
-      { name: 'Inbox', type: 'inbox', unread_count: 5, total_count: 15 },
-      { name: 'Sent Messages', type: 'sent', unread_count: 0, total_count: 10 },
-      { name: 'Junk E-mail', type: 'spam', unread_count: 2, total_count: 2 },
-      { name: 'Deleted Items', type: 'trash', unread_count: 0, total_count: 4 }
-    ];
-  }
-}
-
-// Mock/Fetch helper to simulate pulling headers for new emails
-async function fetchNewMessagesFromSource(
-  account: MailAccount,
-  folder: Omit<MailFolder, 'id' | 'account_id'>,
-  folderId: string
-): Promise<Omit<MailMessage, 'id' | 'account_id' | 'folder_id'>[]> {
-  const nowStr = new Date().toISOString();
-  
-  if (account.type === 'gmail') {
-    if (folder.type === 'inbox') {
-      return [
-        {
-          external_id: `g_msg_1_${account.id}`,
-          subject: 'Welcome to Vencore Workspace!',
-          sender: 'Vencore onboarding <welcome@vencore.in>',
-          recipient: account.email,
-          date: nowStr,
-          snippet: 'Hi there, welcome to Vencore. This is a white-labeled dashboard...',
-          is_read: false,
-          flags: ['IMPORTANT']
-        },
-        {
-          external_id: `g_msg_2_${account.id}`,
-          subject: 'Weekly CRM Analytics Report',
-          sender: 'CRM Automations <reports@vencore.in>',
-          recipient: account.email,
-          date: new Date(Date.now() - 3600000).toISOString(),
-          snippet: 'Your weekly sales pipeline dashboard is ready. Total deals closed: $25K.',
-          is_read: true,
-          flags: []
-        }
-      ];
-    } else if (folder.type === 'spam') {
-      return [
-        {
-          external_id: `g_msg_3_${account.id}`,
-          subject: 'Buy cheap domain name today!',
-          sender: 'Spam Sender <info@domainpromo.xyz>',
-          recipient: account.email,
-          date: nowStr,
-          snippet: 'Limited time offer! Buy dot-com domain names for only $1.99...',
-          is_read: false,
-          flags: []
-        }
-      ];
-    }
-  } else {
-    if (folder.type === 'inbox') {
-      return [
-        {
-          external_id: `i_msg_1_${account.id}`,
-          subject: 'Technical Alert: Server CPU Spike',
-          sender: 'Monitor Agent <alerts@vencore.in>',
-          recipient: account.email,
-          date: nowStr,
-          snippet: 'Warning: CPU usage on prod-web-01 reached 89% for 2 consecutive minutes...',
-          is_read: false,
-          flags: ['alert']
-        }
-      ];
-    }
-  }
-  
-  return [];
-}
-
-// Fetch mail message HTML/plain text body on-demand (keeps DB light)
+// Fetch mail message HTML body from real IMAP server
 async function fetchMessageBodyFromSource(vencore: any, accountId: string, messageId: string): Promise<string> {
   const msg = (await vencore.table('mail_messages').get(messageId)) as MailMessage;
   if (!msg) throw new Error('Message not found');
 
-  // Check if this is a custom sent message stored in the key-value storage
   const storedBody = await vencore.storage.get(`body:${msg.external_id}`);
   if (storedBody) {
     try {
@@ -421,66 +473,55 @@ async function fetchMessageBodyFromSource(vencore: any, accountId: string, messa
     }
   }
 
-  if (msg.external_id.startsWith('g_msg_1')) {
-    return `
-      <div style="font-family: sans-serif; padding: 20px; line-height: 1.6; color: #333;">
-        <h2 style="color: #2d6a4f; margin-top: 0;">Welcome to Vencore!</h2>
-        <p>Dear Customer,</p>
-        <p>We are thrilled to welcome you to your new white-labeled workspace platform. Vencore is designed to coordinate your sales, CRM, project management, and server monitoring in one single dashboard.</p>
-        <p>Feel free to explore our <strong>Module registry</strong> and install plugins like Zoho CRM, Slack messaging, or custom database connectors.</p>
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 24px 0;" />
-        <p style="font-size: 12px; color: #888;">This is an automated onboarding email sent by Vencore HQ.</p>
-      </div>
-    `;
-  }
+  const account = (await vencore.table('mail_accounts').get(accountId)) as MailAccount;
+  if (!account) throw new Error('Account not found');
 
-  if (msg.external_id.startsWith('g_msg_2')) {
-    return `
-      <div style="font-family: sans-serif; padding: 20px; line-height: 1.6;">
-        <h3>Weekly CRM Sales Pipeline Report</h3>
-        <p>Hello Team,</p>
-        <p>Here is your weekly summary of closed deals:</p>
-        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
-          <thead>
-            <tr style="background: #f7f6f2; border-bottom: 1.5px solid #e4e0d8;">
-              <th style="padding: 8px; text-align: left;">Deal Name</th>
-              <th style="padding: 8px; text-align: right;">Value</th>
-              <th style="padding: 8px; text-align: left;">Owner</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr style="border-bottom: 1px solid #e4e0d8;">
-              <td style="padding: 8px;">Acme Corp Subscription</td>
-              <td style="padding: 8px; text-align: right;">$15,000</td>
-              <td style="padding: 8px;">Jane Smith</td>
-            </tr>
-            <tr style="border-bottom: 1px solid #e4e0d8;">
-              <td style="padding: 8px;">Beta Group CRM Pilot</td>
-              <td style="padding: 8px; text-align: right;">$10,000</td>
-              <td style="padding: 8px;">Alex Rivera</td>
-            </tr>
-          </tbody>
-        </table>
-        <p>Keep up the great work!</p>
-      </div>
-    `;
-  }
+  const folder = (await vencore.table('mail_folders').get(msg.folder_id)) as MailFolder;
+  if (!folder) throw new Error('Folder not found');
 
-  if (msg.external_id.startsWith('g_msg_3')) {
-    return `
-      <div style="padding: 16px; font-family: sans-serif; color: #555;">
-        <p><strong>SPAM DETECTED:</strong> This message was marked as spam.</p>
-        <p>Get dot-com domain names for only $1.99! Limited time promo offer. Click here to claim your deal now.</p>
-      </div>
-    `;
-  }
+  const creds = account.credentials;
+  const client = new ImapFlow({
+    host: account.type === 'gmail' ? 'imap.gmail.com' : (creds.host || ''),
+    port: account.type === 'gmail' ? 993 : (creds.port || 993),
+    secure: true,
+    auth: {
+      user: account.email,
+      pass: creds.password
+    },
+    logger: false,
+    tls: {
+      rejectUnauthorized: false
+    }
+  });
 
-  return `
-    <div style="font-family: sans-serif; padding: 20px;">
-      <h4 style="color: #991b1b;">⚠️ System Monitoring Alert</h4>
-      <p><strong>Server</strong>: <code>prod-web-01</code> (10.0.0.1)</p>
-      <p><strong>Metric Alert</strong>: CPU utilization has exceeded warning threshold (85%). Current load: <strong>89%</strong>.</p>
-      <p>Please log in to your Vencore Server Terminal to investigate standard resource utilization.</p>
-    </div>
-  `;
+  await client.connect();
+
+  try {
+    const lock = await client.getMailboxLock(folder.name);
+    try {
+      const parsedUid = parseInt(msg.external_id);
+      if (isNaN(parsedUid)) {
+        return `<div style="padding: 20px; font-family: sans-serif; color: #555555;">This email body could not be fetched (UID sequence invalid).</div>`;
+      }
+
+      // Fetch raw email source block
+      const fetched = await client.fetchOne(String(parsedUid), { source: true }, { uid: true });
+      if (fetched && fetched.source) {
+        // Parse email raw headers and content using simpleParser
+        const parsed = await simpleParser(fetched.source);
+        let bodyHtml = parsed.html || parsed.textAsHtml || `<div style="white-space: pre-wrap;">${parsed.text || ''}</div>`;
+        
+        return `
+          <div style="font-family: sans-serif; padding: 20px; line-height: 1.6; color: #111111; background: #ffffff;">
+            ${bodyHtml}
+          </div>
+        `;
+      }
+      return `<div style="padding: 20px; font-family: sans-serif; color: #555555;">Email source content is empty.</div>`;
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout();
+  }
 }
